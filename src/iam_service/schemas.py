@@ -50,6 +50,78 @@ class ExternalIdentityView(BaseModel):
     created_at: datetime
 
 
+class IdentityProviderCreate(BaseModel):
+    key: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{1,118}[a-z0-9]$")
+    issuer: str = Field(min_length=1, max_length=500)
+    audience: str = Field(min_length=1, max_length=200)
+    jwks_uri: str = Field(alias="jwksUri", default="", max_length=500)
+    subject_claim: str = Field(alias="subjectClaim", default="sub", max_length=80)
+    external_id_claim: str = Field(alias="externalIdClaim", default="sub", max_length=80)
+    group_claim: str = Field(alias="groupClaim", default="groups", max_length=80)
+    group_mappings: dict[str, str] = Field(alias="groupMappings", default_factory=dict)
+    required_acr_values: list[str] = Field(alias="requiredAcrValues", default_factory=list)
+    required_amr_values: list[str] = Field(alias="requiredAmrValues", default_factory=list)
+    lifecycle_profile: str = Field(
+        alias="lifecycleProfile", default="read_only", pattern=r"^(read_only|managed)$"
+    )
+    jwks_cache_ttl_seconds: int = Field(alias="jwksCacheTtlSeconds", default=300, ge=0, le=86400)
+    jwks_stale_grace_seconds: int = Field(
+        alias="jwksStaleGraceSeconds", default=900, ge=0, le=86400
+    )
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
+class IdentityProviderView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    key: str
+    issuer: str
+    audience: str
+    jwks_uri: str
+    subject_claim: str
+    external_id_claim: str
+    group_claim: str
+    group_mappings: dict[str, str]
+    required_acr_values: list[str]
+    required_amr_values: list[str]
+    lifecycle_profile: str
+    status: str
+
+
+class FederationAuthenticateRequest(BaseModel):
+    """Federation принимает только upstream token.
+
+    `extra="forbid"` не даёт клиенту прислать LDAP username/password: пароль
+    проверяет исключительно IdP, IAM его никогда не видит.
+    """
+
+    identity_provider: str = Field(alias="identityProvider", min_length=1, max_length=120)
+    token: str = Field(min_length=1)
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
+class FederationAuthenticationContext(BaseModel):
+    acr: str | None = None
+    amr: list[str] = Field(default_factory=list)
+    auth_time: datetime | None = Field(alias="authTime", default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class FederatedIdentityView(BaseModel):
+    principal_id: uuid.UUID = Field(alias="principalId")
+    identity_provider: str = Field(alias="identityProvider")
+    groups: list[str]
+    authentication_context: FederationAuthenticationContext = Field(alias="authenticationContext")
+    identity_provider_stale: bool = Field(alias="identityProviderStale", default=False)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class AudienceCreate(BaseModel):
     key: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{1,118}[a-z0-9]$")
     allowed_scopes: list[str] = Field(alias="allowedScopes", default_factory=list)

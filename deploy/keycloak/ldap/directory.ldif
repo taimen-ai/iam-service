@@ -1,0 +1,23 @@
+# Структура каталога для reference deployment: организационные единицы,
+# один пользователь и одна группа. Пароли здесь не хранятся — их задаёт
+# сервис `ldap-seed` через `ldappasswd` значением из окружения.
+dn: ou=users,dc=example,dc=org
+objectClass: organizationalUnit
+ou: users
+
+dn: ou=groups,dc=example,dc=org
+objectClass: organizationalUnit
+ou: groups
+
+dn: uid=directory-operator,ou=users,dc=example,dc=org
+objectClass: inetOrgPerson
+objectClass: organizationalPerson
+uid: directory-operator
+cn: Directory
+sn: Operator
+mail: directory-operator@example.org
+
+dn: cn=platform-operators,ou=groups,dc=example,dc=org
+objectClass: groupOfNames
+cn: platform-operators
+member: uid=directory-operator,ou=users,dc=example,dc=org

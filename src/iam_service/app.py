@@ -16,6 +16,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from iam_service.config import Settings
 from iam_service.db import Database
+from iam_service.federation import (
+    FederationError,
+    JsonFetcher,
+    JwksResolver,
+    ensure_authentication_context,
+    project_groups,
+    read_claims,
+    verify_upstream_token,
+)
+from iam_service.federation.linking import (
+    link_identity,
+    reconcile_group_projection,
+    touch_authentication,
+)
 from iam_service.models import (
     Audience,
     AuditEvent,
@@ -23,6 +37,7 @@ from iam_service.models import (
     ExternalIdentity,
     Group,
     GroupMember,
+    IdentityProvider,
     OutboxEvent,
     Principal,
     ServiceAccount,
@@ -36,10 +51,15 @@ from iam_service.schemas import (
     EventView,
     ExternalIdentityCreate,
     ExternalIdentityView,
+    FederatedIdentityView,
+    FederationAuthenticateRequest,
+    FederationAuthenticationContext,
     GroupCreate,
     GroupMemberCreate,
     GroupMemberView,
     GroupView,
+    IdentityProviderCreate,
+    IdentityProviderView,
     PrincipalCreate,
     PrincipalView,
     ServiceAccountCreate,
@@ -52,10 +72,13 @@ from iam_service.schemas import (
 from iam_service.tokens import TokenIssuer
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None, *, jwks_fetcher: JsonFetcher | None = None
+) -> FastAPI:
     runtime_settings = settings or Settings()
     database = Database(runtime_settings)
     password_hasher = PasswordHasher()
+    jwks_resolver = JwksResolver(jwks_fetcher)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -225,6 +248,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session: AsyncSession = Depends(get_session),
     ) -> ExternalIdentity:
         principal = await tenant_principal(session, tenant_id, principal_id)
+        managed_by = await session.scalar(
+            select(IdentityProvider).where(
+                IdentityProvider.tenant_id == tenant_id,
+                IdentityProvider.issuer == body.issuer,
+                IdentityProvider.status == "active",
+                IdentityProvider.lifecycle_profile == "read_only",
+            )
+        )
+        if managed_by is not None:
+            raise HTTPException(status_code=409, detail="identity_provider_managed")
         identity = ExternalIdentity(
             principal_id=principal.id,
             issuer=body.issuer,
@@ -260,6 +293,168 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await session.rollback()
             raise HTTPException(status_code=409, detail="external_identity_exists") from exc
         return identity
+
+    @app.post(
+        "/api/v1/tenants/{tenant_id}/identity-providers",
+        response_model=IdentityProviderView,
+        status_code=201,
+    )
+    async def create_identity_provider(
+        tenant_id: uuid.UUID,
+        body: IdentityProviderCreate,
+        actor: str = Depends(require_bootstrap),
+        session: AsyncSession = Depends(get_session),
+    ) -> IdentityProvider:
+        if await session.get(Tenant, tenant_id) is None:
+            raise HTTPException(status_code=404, detail="tenant_not_found")
+        if not body.issuer.startswith(("http://", "https://")):
+            raise HTTPException(status_code=422, detail="invalid_issuer")
+        provider = IdentityProvider(
+            tenant_id=tenant_id,
+            key=body.key,
+            issuer=body.issuer.rstrip("/") if body.issuer.endswith("/") else body.issuer,
+            audience=body.audience,
+            jwks_uri=body.jwks_uri,
+            subject_claim=body.subject_claim,
+            external_id_claim=body.external_id_claim,
+            group_claim=body.group_claim,
+            group_mappings=dict(body.group_mappings),
+            required_acr_values=sorted(set(body.required_acr_values)),
+            required_amr_values=sorted(set(body.required_amr_values)),
+            lifecycle_profile=body.lifecycle_profile,
+            jwks_cache_ttl_seconds=body.jwks_cache_ttl_seconds,
+            jwks_stale_grace_seconds=body.jwks_stale_grace_seconds,
+        )
+        session.add(provider)
+        try:
+            await session.flush()
+            session.add(
+                OutboxEvent(
+                    tenant_id=tenant_id,
+                    type="identity_provider.registered",
+                    aggregate_type="identity_provider",
+                    aggregate_id=provider.id,
+                    payload={
+                        "identityProviderId": str(provider.id),
+                        "key": provider.key,
+                        "lifecycleProfile": provider.lifecycle_profile,
+                    },
+                )
+            )
+            session.add(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    action="identity_providers.create",
+                    actor_ref=actor,
+                    resource_type="identity_provider",
+                    resource_id=provider.id,
+                    outcome="allowed",
+                    reason=f"provider:{provider.key}",
+                )
+            )
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail="identity_provider_exists") from exc
+        return provider
+
+    @app.post(
+        "/api/v1/tenants/{tenant_id}/federation:authenticate",
+        response_model=FederatedIdentityView,
+    )
+    async def authenticate_federated_identity(
+        tenant_id: uuid.UUID,
+        body: FederationAuthenticateRequest,
+        session: AsyncSession = Depends(get_session),
+    ) -> FederatedIdentityView:
+        provider = await session.scalar(
+            select(IdentityProvider).where(
+                IdentityProvider.tenant_id == tenant_id,
+                IdentityProvider.key == body.identity_provider,
+                IdentityProvider.status == "active",
+            )
+        )
+        if provider is None:
+            raise HTTPException(status_code=404, detail="identity_provider_not_found")
+        provider_id, provider_key = provider.id, provider.key
+        try:
+            resolved = await jwks_resolver.resolve(
+                provider_id=provider.id,
+                issuer=provider.issuer,
+                jwks_uri=provider.jwks_uri,
+                cache_ttl_seconds=provider.jwks_cache_ttl_seconds,
+                stale_grace_seconds=provider.jwks_stale_grace_seconds,
+            )
+            claims = verify_upstream_token(
+                body.token,
+                keys=resolved.keys,
+                issuer=provider.issuer,
+                audience=provider.audience,
+            )
+            upstream = read_claims(
+                claims,
+                subject_claim=provider.subject_claim,
+                external_id_claim=provider.external_id_claim,
+                group_claim=provider.group_claim,
+            )
+            ensure_authentication_context(
+                upstream.context,
+                required_acr_values=provider.required_acr_values,
+                required_amr_values=provider.required_amr_values,
+            )
+            linked = await link_identity(
+                session, tenant_id=tenant_id, provider=provider, upstream=upstream
+            )
+            groups = await reconcile_group_projection(
+                session,
+                tenant_id=tenant_id,
+                provider=provider,
+                principal_id=linked.principal.id,
+                group_keys=project_groups(upstream.groups, mappings=provider.group_mappings),
+            )
+        except (FederationError, IntegrityError) as exc:
+            await session.rollback()
+            code = exc.code if isinstance(exc, FederationError) else "external_identity_conflict"
+            status_code = exc.status_code if isinstance(exc, FederationError) else 409
+            session.add(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    action="federation.authenticate",
+                    actor_ref=f"provider:{provider_key}",
+                    resource_type="identity_provider",
+                    resource_id=provider_id,
+                    outcome="denied",
+                    reason=code,
+                )
+            )
+            await session.commit()
+            raise HTTPException(status_code=status_code, detail=code) from exc
+
+        touch_authentication(linked.identity, acr=upstream.context.acr)
+        session.add(
+            AuditEvent(
+                tenant_id=tenant_id,
+                action="federation.authenticate",
+                actor_ref=str(linked.principal.id),
+                resource_type="external_identity",
+                resource_id=linked.identity.id,
+                outcome="allowed",
+                reason=f"provider:{provider.key} acr:{upstream.context.acr or 'none'}"
+                + (" jwks:stale" if resolved.stale else ""),
+            )
+        )
+        await session.commit()
+        return FederatedIdentityView(
+            principalId=linked.principal.id,
+            identityProvider=provider.key,
+            groups=groups,
+            authenticationContext=FederationAuthenticationContext(
+                acr=upstream.context.acr,
+                amr=list(upstream.context.amr),
+                authTime=upstream.context.auth_time,
+            ),
+            identityProviderStale=resolved.stale,
+        )
 
     @app.post("/api/v1/tenants/{tenant_id}/audiences", response_model=AudienceView, status_code=201)
     async def create_audience(
@@ -341,6 +536,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         if group is None:
             raise HTTPException(status_code=404, detail="group_not_found")
+        if group.source == "federated":
+            raise HTTPException(status_code=409, detail="group_is_federated")
         await tenant_principal(session, tenant_id, body.principal_id)
         member = GroupMember(
             tenant_id=tenant_id,

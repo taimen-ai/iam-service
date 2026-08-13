@@ -23,7 +23,26 @@ Memory Service или другого продукта.
 - отдельный audit без token/secret/subject payload;
 - Alembic migration и Docker Compose с собственной PostgreSQL.
 
-Не входят в этот срез: Platform Access Token человека, OIDC/SCIM adapters,
+## Identity federation
+
+- registry upstream identity providers: issuer, ожидаемый audience, claim names,
+  allowlist групп и lifecycle profile;
+- OIDC discovery и JWKS с кэшем, bounded stale window и fail closed после него;
+- строгая проверка upstream token: подпись, точный issuer, точный audience,
+  временные claims; симметричные алгоритмы и `none` отклоняются;
+- linking по `issuer + subject` со сверкой стабильного external ID
+  (для LDAP — `entryUUID`), чтобы одна upstream identity не получила двух
+  Principals;
+- authentication context `acr`/`amr`/`auth_time` и step-up: недостаточный
+  контекст закрывает вход, а не понижает требования;
+- проекция upstream-групп в IAM Groups строго по allowlist mappings;
+- reference deployment Keycloak с LDAP User Federation в `deploy/keycloak`.
+
+Federation подтверждает identity и групповую проекцию. Она не выдаёт Product
+Entitlement, audience credential или service-local role: доступ к ресурсу
+по-прежнему требует отдельных решений entitlement и domain policy.
+
+Не входят в этот срез: Platform Access Token человека, SCIM adapter,
 Entitlement Service, product licensing и service-local domain RBAC.
 
 ## Быстрый запуск
@@ -64,6 +83,11 @@ IAM_DATABASE_URL=postgresql+psycopg://iam:iam@localhost:5435/iam \
 Для production-like запуска `IAM_CREATE_SCHEMA_ON_STARTUP` остаётся `false`:
 schema изменяет только Alembic.
 
+Обычный прогон тестов автономен и использует локальный фиктивный OIDC issuer.
+Проверка против живого Keycloak с LDAP описана в
+[deploy/keycloak/README.md](deploy/keycloak/README.md) и запускается отдельно
+через `pytest -m integration`.
+
 ## Основные HTTP-контракты
 
 Bootstrap management API:
@@ -72,6 +96,7 @@ Bootstrap management API:
 - `POST /api/v1/tenants/{tenantId}/principals`;
 - `GET /api/v1/tenants/{tenantId}/principals/{principalId}`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities`;
+- `POST /api/v1/tenants/{tenantId}/identity-providers`;
 - `POST /api/v1/tenants/{tenantId}/groups`;
 - `POST /api/v1/tenants/{tenantId}/groups/{groupId}/members`;
 - `POST /api/v1/tenants/{tenantId}/audiences`;
@@ -79,10 +104,17 @@ Bootstrap management API:
 - `POST /api/v1/tenants/{tenantId}/service-accounts/{clientId}:revoke`;
 - `GET /api/v1/events`.
 
-Credential API:
+Credential и federation API:
 
 - `POST /api/v1/tokens/exchange`;
+- `POST /api/v1/tenants/{tenantId}/federation:authenticate`;
 - `GET /.well-known/jwks.json`.
+
+`federation:authenticate` принимает только upstream token: поля `username` и
+`password` контрактом запрещены, пароль каталога проверяет исключительно IdP.
+Пока upstream IdP зарегистрирован с профилем `read_only`, ручная привязка
+external identity для его issuer закрыта, а federated группы не редактируются
+локальным API — состав задаёт upstream.
 
 Bootstrap header является временной administration boundary первого среза. Его
 нельзя проксировать внешним клиентам или считать заменой scoped IAM admin role.

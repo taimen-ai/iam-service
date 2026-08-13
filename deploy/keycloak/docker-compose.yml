@@ -1,0 +1,103 @@
+# Reference deployment upstream IdP для iam-service.
+#
+# Ни один пароль и bind credential не хранится в этих файлах: значения приходят
+# из окружения развёртывания, а `:?` останавливает запуск, если переменная не
+# задана. Realm импортируется декларативно, поэтому окружение воспроизводимо.
+services:
+  openldap:
+    image: osixia/openldap:1.5.0
+    command: ["--copy-service"]
+    environment:
+      LDAP_ORGANISATION: ${LDAP_ORGANISATION:-Example Organisation}
+      LDAP_DOMAIN: ${LDAP_DOMAIN:-example.org}
+      LDAP_ADMIN_PASSWORD: ${LDAP_ADMIN_PASSWORD:?set LDAP_ADMIN_PASSWORD in the environment}
+      LDAP_CONFIG_PASSWORD: ${LDAP_ADMIN_PASSWORD:?set LDAP_ADMIN_PASSWORD in the environment}
+    ports:
+      - "1389:389"
+    healthcheck:
+      # Bind как admin: анонимное чтение каталога закрыто по умолчанию.
+      # Пароль читается из окружения контейнера и не попадает в compose config.
+      test:
+        - "CMD-SHELL"
+        - "ldapsearch -x -H ldap://127.0.0.1:389 -D cn=admin,${LDAP_ROOT:-dc=example,dc=org} -w \"$$LDAP_ADMIN_PASSWORD\" -b ${LDAP_ROOT:-dc=example,dc=org} -s base >/dev/null"
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  ldap-seed:
+    image: osixia/openldap:1.5.0
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -eu
+        ldapadd -c -x -H ldap://openldap:389 \
+          -D "cn=admin,${LDAP_ROOT:-dc=example,dc=org}" -w "$$LDAP_ADMIN_PASSWORD" \
+          -f /seed/directory.ldif || [ $$? -eq 68 ]
+        ldappasswd -x -H ldap://openldap:389 \
+          -D "cn=admin,${LDAP_ROOT:-dc=example,dc=org}" -w "$$LDAP_ADMIN_PASSWORD" \
+          -s "$$LDAP_TEST_USER_PASSWORD" \
+          "uid=${LDAP_TEST_USER:-directory-operator},ou=users,${LDAP_ROOT:-dc=example,dc=org}"
+    environment:
+      LDAP_ADMIN_PASSWORD: ${LDAP_ADMIN_PASSWORD:?set LDAP_ADMIN_PASSWORD in the environment}
+      LDAP_TEST_USER_PASSWORD: ${LDAP_TEST_USER_PASSWORD:?set LDAP_TEST_USER_PASSWORD in the environment}
+    volumes:
+      - ./ldap:/seed:ro
+    depends_on:
+      openldap:
+        condition: service_healthy
+    restart: "no"
+
+  # Realm-import Keycloak не разворачивает переменные окружения, поэтому
+  # connection и bind credential подставляются в шаблон перед стартом. В Git
+  # остаётся только шаблон с плейсхолдерами.
+  realm-render:
+    image: busybox:1.36
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        sed -e "s|__LDAP_CONNECTION_URL__|$$LDAP_CONNECTION_URL|g" \
+            -e "s|__LDAP_USERS_DN__|$$LDAP_USERS_DN|g" \
+            -e "s|__LDAP_GROUPS_DN__|$$LDAP_GROUPS_DN|g" \
+            -e "s|__LDAP_BIND_DN__|$$LDAP_BIND_DN|g" \
+            -e "s|__LDAP_BIND_CREDENTIAL__|$$LDAP_BIND_CREDENTIAL|g" \
+            /template/platform-realm.json > /import/platform-realm.json
+    environment:
+      LDAP_CONNECTION_URL: ${LDAP_CONNECTION_URL:-ldap://openldap:389}
+      LDAP_USERS_DN: ou=users,${LDAP_ROOT:-dc=example,dc=org}
+      LDAP_GROUPS_DN: ou=groups,${LDAP_ROOT:-dc=example,dc=org}
+      LDAP_BIND_DN: cn=admin,${LDAP_ROOT:-dc=example,dc=org}
+      LDAP_BIND_CREDENTIAL: ${LDAP_ADMIN_PASSWORD:?set LDAP_ADMIN_PASSWORD in the environment}
+    volumes:
+      - ./realm-template:/template:ro
+      - realm-import:/import
+    restart: "no"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.5.2
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD in the environment}
+      KC_HTTP_PORT: "8081"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - realm-import:/opt/keycloak/data/import:ro
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    depends_on:
+      openldap:
+        condition: service_healthy
+      realm-render:
+        condition: service_completed_successfully
+
+volumes:
+  realm-import:

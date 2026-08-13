@@ -70,20 +70,70 @@ class TenantMembership(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class IdentityProvider(Base):
+    """Upstream OIDC issuer (Keycloak reference deployment или совместимый IdP).
+
+    IAM хранит только non-secret конфигурацию доверия: issuer, audience, набор
+    claim names и allowlist групп. Пароли, client secrets и LDAP bind credentials
+    остаются в deployment environment самого IdP.
+    """
+
+    __tablename__ = "identity_providers"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "key", name="uq_identity_providers_tenant_key"),
+        UniqueConstraint("tenant_id", "issuer", name="uq_identity_providers_tenant_issuer"),
+        CheckConstraint("status IN ('active', 'disabled')", name="status"),
+        CheckConstraint("lifecycle_profile IN ('read_only', 'managed')", name="lifecycle_profile"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("tenants.id"))
+    key: Mapped[str] = mapped_column(String(120))
+    issuer: Mapped[str] = mapped_column(String(500))
+    audience: Mapped[str] = mapped_column(String(200))
+    jwks_uri: Mapped[str] = mapped_column(String(500), default="")
+    subject_claim: Mapped[str] = mapped_column(String(80), default="sub")
+    external_id_claim: Mapped[str] = mapped_column(String(80), default="sub")
+    group_claim: Mapped[str] = mapped_column(String(80), default="groups")
+    group_mappings: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    required_acr_values: Mapped[list[str]] = mapped_column(JSON, default=list)
+    required_amr_values: Mapped[list[str]] = mapped_column(JSON, default=list)
+    lifecycle_profile: Mapped[str] = mapped_column(String(20), default="read_only")
+    jwks_cache_ttl_seconds: Mapped[int] = mapped_column(default=300)
+    jwks_stale_grace_seconds: Mapped[int] = mapped_column(default=900)
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ExternalIdentity(Base):
     __tablename__ = "external_identities"
     __table_args__ = (
         UniqueConstraint("issuer", "subject", name="uq_external_identities_issuer_subject"),
+        UniqueConstraint(
+            "identity_provider_id",
+            "external_id",
+            name="uq_external_identities_provider_external_id",
+        ),
         CheckConstraint("status IN ('active', 'disabled')", name="status"),
+        CheckConstraint("source IN ('manual', 'federated')", name="source"),
         Index("ix_external_identities_principal", "principal_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     principal_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("principals.id"))
+    identity_provider_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("identity_providers.id"), nullable=True
+    )
     issuer: Mapped[str] = mapped_column(String(500))
     subject: Mapped[str] = mapped_column(String(500))
+    external_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    source: Mapped[str] = mapped_column(String(20), default="manual")
     status: Mapped[str] = mapped_column(String(20), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_authenticated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_acr: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
 class Audience(Base):
@@ -126,12 +176,17 @@ class Group(Base):
         UniqueConstraint("tenant_id", "key", name="uq_groups_tenant_key"),
         UniqueConstraint("tenant_id", "id", name="uq_groups_tenant_id"),
         CheckConstraint("status IN ('active', 'disabled')", name="status"),
+        CheckConstraint("source IN ('local', 'federated')", name="source"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("tenants.id"))
     key: Mapped[str] = mapped_column(String(120))
     name: Mapped[str] = mapped_column(String(200))
+    source: Mapped[str] = mapped_column(String(20), default="local")
+    identity_provider_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("identity_providers.id"), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(20), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -150,12 +205,17 @@ class GroupMember(Base):
             name="fk_group_members_membership",
         ),
         UniqueConstraint("group_id", "principal_id", name="uq_group_members_entry"),
+        CheckConstraint("source IN ('local', 'federated')", name="source"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     group_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     principal_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    source: Mapped[str] = mapped_column(String(20), default="local")
+    identity_provider_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("identity_providers.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
