@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: iam
+      POSTGRES_PASSWORD: iam
+      POSTGRES_DB: iam
+    ports:
+      - "5435:5432"
+    volumes:
+      - iam_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iam -d iam"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  api:
+    build: .
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn iam_service.app:app --host 0.0.0.0 --port 8010"
+    environment:
+      IAM_DATABASE_URL: postgresql+psycopg://iam:iam@db:5432/iam
+      IAM_BOOTSTRAP_TOKEN: ${IAM_BOOTSTRAP_TOKEN:-dev-bootstrap-token-change-me}
+      IAM_ISSUER: ${IAM_ISSUER:-http://localhost:8010}
+      IAM_SIGNING_PRIVATE_KEY_FILE: /run/secrets/iam_signing_key
+      IAM_SIGNING_KEY_ID: ${IAM_SIGNING_KEY_ID:-local-dev}
+    ports:
+      - "8010:8010"
+    secrets:
+      - iam_signing_key
+    depends_on:
+      db:
+        condition: service_healthy
+
+secrets:
+  iam_signing_key:
+    file: ./.secrets/iam-signing.pem
+
+volumes:
+  iam_db_data:
