@@ -42,8 +42,69 @@ Federation подтверждает identity и групповую проекц�
 Entitlement, audience credential или service-local role: доступ к ресурсу
 по-прежнему требует отдельных решений entitlement и domain policy.
 
-Не входят в этот срез: SCIM adapter, Entitlement Service, product licensing и
-service-local domain RBAC.
+Не входят в этот срез: Entitlement Service, product licensing и service-local
+domain RBAC.
+
+## SCIM 2.0 provisioning
+
+Identity Provisioning Adapter принимает входящий SCIM 2.0 от кадровой системы
+или IGA и проецирует его на Principal, external identity и глобальные группы.
+
+- `Users` и `Groups` с `POST`, `GET`, `PUT`, `PATCH`, `DELETE`, фильтрацией и
+  постраничной выдачей; `ServiceProviderConfig`, `ResourceTypes` и `Schemas`
+  объявляют ровно то, что действительно поддерживается;
+- сопоставление ведётся по стабильному `externalId`: `userName` может меняться
+  вместе с почтой сотрудника и внутренним identity key не является;
+- профильные атрибуты (`name`, `emails`, телефоны) принимаются и отбрасываются —
+  IAM не является каталогом персональных данных;
+- фильтр поддерживает только `eq` и `and`; неподдерживаемый оператор отклоняется
+  как `invalidFilter`, а не молча расширяет выборку;
+- `ETag` и `If-Match` защищают от гонки двух reconciliation-проходов; повтор
+  `add`/`remove` членства идемпотентен и не меняет версию ресурса;
+- ошибки возвращаются документом `urn:ietf:params:scim:api:messages:2.0:Error`.
+
+SCIM-клиент предъявляет audience-bound access token своей confidential service
+identity (`IAM_SCIM_AUDIENCE`, scope `IAM_SCIM_SCOPE`). Человеческий credential
+на `/scim/v2` не принимается: provisioning управляет чужим lifecycle и способом
+входа не является. Source определяется по service identity из токена, поэтому
+клиент не может объявить чужой tenant.
+
+### Один authoritative source на population
+
+Population — это upstream identity provider. Пара `(tenant, provider)`
+уникальна, поэтому SCIM и LDAP не могут писать в одну population одновременно, а
+для провайдера с профилем `read_only` (его lifecycle ведёт каталог)
+SCIM-источник не регистрируется вовсе.
+
+Provisioning заводит identity до первого входа, когда реального OIDC `sub` ещё
+нет. Пока его нет, `subject` держит неколлизионный placeholder, а при первом
+federation-входе запись находится по стабильному external ID и `subject`
+заменяется настоящим. Второй Principal при этом не появляется.
+
+### Lifecycle и деинициализация
+
+`active: false` и `DELETE` отключают Principal и немедленно отзывают все его
+Platform Access Token — срочный отзыв не ждёт следующего цикла синхронизации.
+Удаление снимает только те mappings, которые породил этот source: локальные
+членства и identity других источников остаются нетронутыми. Состав provisioned
+и federated групп задаёт upstream, поэтому локальный API в них не пишет.
+
+Provisioning не выдаёт Product Entitlement и service-local grants: доступ к
+ресурсу по-прежнему требует отдельных решений entitlement-service и domain
+policy продукта.
+
+### Драйвер Keycloak и устаревание источника
+
+Запись в upstream настраивается на источнике: `off` оставляет только проекцию
+IAM, `scim` использует native SCIM API Keycloak, `admin` — стабильный Admin API,
+`auto` пробует SCIM и падает обратно на Admin API, если endpoint не развёрнут
+или временно недоступен. Недоступность обеих дорог закрывает запись целиком
+(`502`): расхождение проекции IAM с каталогом опаснее отказа.
+
+Момент последней синхронизации хранится на источнике.
+`GET /api/v1/tenants/{tenantId}/provisioning-sources` показывает признак
+`stale`, а первое обнаружение публикует событие `provisioning_source.stale` —
+один раз на эпизод, а не на каждое чтение.
 
 ## Platform Access Token
 
@@ -143,7 +204,16 @@ Bootstrap management API:
 - `POST /api/v1/tenants/{tenantId}/platform-access-tokens/{credentialId}:rotate`;
 - `POST /api/v1/tenants/{tenantId}/platform-access-tokens/{credentialId}:revoke`;
 - `POST /api/v1/tenants/{tenantId}/legacy-credentials:import`;
+- `POST /api/v1/tenants/{tenantId}/provisioning-sources`;
+- `GET /api/v1/tenants/{tenantId}/provisioning-sources`;
 - `GET /api/v1/events`.
+
+SCIM 2.0 API (confidential service identity):
+
+- `GET|POST /scim/v2/Users` и `GET|PUT|PATCH|DELETE /scim/v2/Users/{id}`;
+- `GET|POST /scim/v2/Groups` и `GET|PUT|PATCH|DELETE /scim/v2/Groups/{id}`;
+- `GET /scim/v2/ServiceProviderConfig`, `/scim/v2/ResourceTypes`,
+  `/scim/v2/Schemas`.
 
 Credential и federation API:
 

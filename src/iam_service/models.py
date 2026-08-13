@@ -115,7 +115,7 @@ class ExternalIdentity(Base):
             name="uq_external_identities_provider_external_id",
         ),
         CheckConstraint("status IN ('active', 'disabled')", name="status"),
-        CheckConstraint("source IN ('manual', 'federated')", name="source"),
+        CheckConstraint("source IN ('manual', 'federated', 'provisioned')", name="source"),
         Index("ix_external_identities_principal", "principal_id"),
     )
 
@@ -123,6 +123,9 @@ class ExternalIdentity(Base):
     principal_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("principals.id"))
     identity_provider_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("identity_providers.id"), nullable=True
+    )
+    provisioning_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("provisioning_sources.id"), nullable=True
     )
     issuer: Mapped[str] = mapped_column(String(500))
     subject: Mapped[str] = mapped_column(String(500))
@@ -176,7 +179,7 @@ class Group(Base):
         UniqueConstraint("tenant_id", "key", name="uq_groups_tenant_key"),
         UniqueConstraint("tenant_id", "id", name="uq_groups_tenant_id"),
         CheckConstraint("status IN ('active', 'disabled')", name="status"),
-        CheckConstraint("source IN ('local', 'federated')", name="source"),
+        CheckConstraint("source IN ('local', 'federated', 'scim')", name="source"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -186,6 +189,9 @@ class Group(Base):
     source: Mapped[str] = mapped_column(String(20), default="local")
     identity_provider_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("identity_providers.id"), nullable=True
+    )
+    provisioning_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("provisioning_sources.id"), nullable=True
     )
     status: Mapped[str] = mapped_column(String(20), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -205,7 +211,7 @@ class GroupMember(Base):
             name="fk_group_members_membership",
         ),
         UniqueConstraint("group_id", "principal_id", name="uq_group_members_entry"),
-        CheckConstraint("source IN ('local', 'federated')", name="source"),
+        CheckConstraint("source IN ('local', 'federated', 'scim')", name="source"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -215,6 +221,9 @@ class GroupMember(Base):
     source: Mapped[str] = mapped_column(String(20), default="local")
     identity_provider_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("identity_providers.id"), nullable=True
+    )
+    provisioning_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("provisioning_sources.id"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

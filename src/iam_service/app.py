@@ -70,11 +70,15 @@ from iam_service.schemas import (
     TokenExchangeRequest,
     TokenResponse,
 )
+from iam_service.scim import UpstreamTransport, create_scim_router
 from iam_service.tokens import TokenIssuer
 
 
 def create_app(
-    settings: Settings | None = None, *, jwks_fetcher: JsonFetcher | None = None
+    settings: Settings | None = None,
+    *,
+    jwks_fetcher: JsonFetcher | None = None,
+    upstream_transport: UpstreamTransport | None = None,
 ) -> FastAPI:
     runtime_settings = settings or Settings()
     database = Database(runtime_settings)
@@ -549,7 +553,9 @@ def create_app(
         )
         if group is None:
             raise HTTPException(status_code=404, detail="group_not_found")
-        if group.source == "federated":
+        if group.source != "local":
+            # Состав federated и provisioned групп задаёт upstream: ручное
+            # членство в них разошлось бы с authoritative source.
             raise HTTPException(status_code=409, detail="group_is_federated")
         await tenant_principal(session, tenant_id, body.principal_id)
         member = GroupMember(
@@ -766,6 +772,15 @@ def create_app(
             settings=runtime_settings,
             get_session=get_session,
             require_bootstrap=require_bootstrap,
+        )
+    )
+    # SCIM 2.0 provisioning — тоже отдельный пакет со своим форматом ошибок.
+    app.include_router(
+        create_scim_router(
+            settings=runtime_settings,
+            get_session=get_session,
+            require_bootstrap=require_bootstrap,
+            upstream_transport=upstream_transport,
         )
     )
     return app

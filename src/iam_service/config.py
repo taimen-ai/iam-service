@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     pat_max_authentication_age_seconds: int = 300
     # Окно совместимости для перенесённых Control Plane API keys.
     legacy_credential_max_ttl_seconds: int = 7776000
+    # SCIM provisioning: отдельный audience и scope confidential service
+    # identity SCIM-клиента, плюс предел страницы выдачи.
+    scim_audience: str = "iam-scim"
+    scim_scope: str = "scim:write"
+    scim_max_page_size: int = 200
 
     def resolved_signing_private_key(self) -> str:
         if self.signing_private_key:
