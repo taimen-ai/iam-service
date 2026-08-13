@@ -140,8 +140,7 @@ class Harness:
             )
 
 
-@pytest.fixture
-def harness(tmp_path):
+def signing_key_pair() -> tuple[str, str]:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     private_pem = private_key.private_bytes(
         serialization.Encoding.PEM,
@@ -156,6 +155,12 @@ def harness(tmp_path):
         )
         .decode()
     )
+    return private_pem, public_pem
+
+
+@pytest.fixture
+def harness(tmp_path):
+    private_pem, public_pem = signing_key_pair()
     database_path = tmp_path / "iam.db"
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{database_path}",
@@ -399,6 +404,74 @@ def test_legacy_control_plane_api_key_works_through_compatibility_mapping(
     assert endless.json()["detail"] == "compatibility_window_too_long"
     assert with_plaintext.status_code == 422
     assert legacy_key not in harness.dump()
+
+
+def test_federation_login_alone_unlocks_issuance(tmp_path, idp, fetcher) -> None:
+    """Вход через IdP открывает выпуск PAT без административного вмешательства.
+
+    Federation пишет снимок аутентификации в той же транзакции, что и linking,
+    поэтому отдельный вызов `authentication-contexts` не нужен.
+    """
+
+    private_pem, public_pem = signing_key_pair()
+    database_path = tmp_path / "iam.db"
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{database_path}",
+        bootstrap_token="test-bootstrap-token",
+        issuer=ISSUER,
+        signing_private_key=private_pem,
+        create_schema_on_startup=True,
+    )
+
+    with TestClient(create_app(settings, jwks_fetcher=fetcher)) as client:
+        tenant_id = client.post(
+            "/api/v1/tenants", headers=BOOTSTRAP, json={"slug": "tenant-a", "name": "A"}
+        ).json()["id"]
+        client.post(
+            f"/api/v1/tenants/{tenant_id}/audiences",
+            headers=BOOTSTRAP,
+            json={"key": "control-plane", "allowedScopes": ["read"]},
+        )
+        client.post(
+            f"/api/v1/tenants/{tenant_id}/identity-providers",
+            headers=BOOTSTRAP,
+            json={"key": "keycloak", "issuer": idp.issuer, "audience": idp.audience},
+        )
+        login = client.post(
+            f"/api/v1/tenants/{tenant_id}/federation:authenticate",
+            json={
+                "identityProvider": "keycloak",
+                "token": idp.token(claims={"acr": "silver", "amr": ["pwd", "otp"]}),
+            },
+        )
+        principal_id = login.json()["principalId"]
+        issued = client.post(
+            f"/api/v1/tenants/{tenant_id}/principals/{principal_id}/platform-access-tokens",
+            headers={**BOOTSTRAP, "Idempotency-Key": str(uuid.uuid4())},
+            json={"name": "claude-code", "audiences": ["control-plane"], "scopeCeiling": ["read"]},
+        )
+        exchanged = client.post(
+            "/api/v1/platform-access-tokens:exchange",
+            json={"token": issued.json()["token"], "audience": "control-plane", "scopes": ["read"]},
+        )
+
+    assert login.status_code == 200, login.text
+    assert issued.status_code == 201, issued.text
+    assert exchanged.status_code == 200, exchanged.text
+    claims = verify_access_token(
+        exchanged.json()["accessToken"],
+        public_key=public_pem,
+        issuer=ISSUER,
+        audience="control-plane",
+    )
+    # Контекст upstream-входа доезжает до выданного токена.
+    assert claims["acr"] == "silver"
+
+    with Session(create_engine(f"sqlite:///{database_path}")) as session:
+        context = session.scalars(select(AuthenticationContext)).one()
+    assert context.source == "federation"
+    assert context.amr == ["otp", "pwd"]
+    assert context.external_identity_id is not None
 
 
 def test_migration_creates_and_drops_credential_tables(tmp_path) -> None:

@@ -44,7 +44,7 @@ from iam_service.models import (
     Tenant,
     TenantMembership,
 )
-from iam_service.pat import create_platform_token_router
+from iam_service.pat import create_platform_token_router, record_authentication_context
 from iam_service.schemas import (
     AudienceCreate,
     AudienceView,
@@ -432,6 +432,18 @@ def create_app(
             raise HTTPException(status_code=status_code, detail=code) from exc
 
         touch_authentication(linked.identity, acr=upstream.context.acr)
+        # Подтверждённый вход открывает человеку выпуск Platform Access Token:
+        # снимок пишется в той же транзакции, что и linking.
+        record_authentication_context(
+            session,
+            tenant_id=tenant_id,
+            principal_id=linked.principal.id,
+            issuer=provider.issuer,
+            acr=upstream.context.acr,
+            amr=list(upstream.context.amr),
+            auth_time=upstream.context.auth_time,
+            external_identity_id=linked.identity.id,
+        )
         session.add(
             AuditEvent(
                 tenant_id=tenant_id,
