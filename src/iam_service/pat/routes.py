@@ -45,6 +45,9 @@ from iam_service.pat.schemas import (
     PlatformAccessTokenView,
     PlatformTokenExchangeRequest,
     PlatformTokenExchangeResponse,
+    PlatformTokenIntrospection,
+    PlatformTokenIntrospectRequest,
+    PlatformTokenSelfRevokeRequest,
     PrincipalDisabled,
 )
 from iam_service.tokens import TokenIssuer
@@ -269,6 +272,67 @@ def create_platform_token_router(
         return PlatformAccessTokenIssued(
             credential=PlatformAccessTokenView.model_validate(credential), token=token
         )
+
+    async def resolve_presented(
+        session: AsyncSession, token: str, *, action: str
+    ) -> tuple[PlatformAccessToken, Principal]:
+        """Найти действующий credential по предъявленному секрету.
+
+        Единая точка входа для всех операций, которые предъявляет локальный
+        плагин: exchange, introspect и self-revoke. Любой дефект — неизвестный
+        prefix, чужой секрет, отзыв, истечение, неактивные tenant, membership
+        или Principal — даёт один и тот же `invalid_token`, а точная причина
+        уходит только в audit.
+        """
+
+        presented = parse_presented_credential(token)
+        credential = None
+        if presented is not None:
+            credential = await session.scalar(
+                select(PlatformAccessToken).where(
+                    PlatformAccessToken.public_prefix == presented.public_prefix,
+                    PlatformAccessToken.kind == presented.kind,
+                )
+            )
+        # Хэш считается всегда, в том числе для несуществующего prefix.
+        stored_hash = credential.secret_hash if credential is not None else _ABSENT_HASH
+        if not matches_stored_hash(token, stored_hash) or credential is None:
+            raise HTTPException(status_code=401, detail=_INVALID_TOKEN)
+
+        async def deny(reason: str) -> HTTPException:
+            session.add(
+                AuditEvent(
+                    tenant_id=credential.tenant_id,
+                    action=action,
+                    actor_ref=str(credential.principal_id),
+                    resource_type="platform_access_token",
+                    resource_id=credential.id,
+                    outcome="denied",
+                    reason=f"pat:{credential.public_prefix} {reason}",
+                )
+            )
+            await session.commit()
+            return HTTPException(status_code=401, detail=_INVALID_TOKEN)
+
+        expires_at = _as_aware(credential.expires_at)
+        if credential.revoked_at is not None:
+            raise await deny("credential_revoked")
+        if expires_at is None or expires_at <= _now():
+            raise await deny("credential_expired")
+
+        tenant = await session.get(Tenant, credential.tenant_id)
+        membership = await session.get(
+            TenantMembership,
+            {"tenant_id": credential.tenant_id, "principal_id": credential.principal_id},
+        )
+        principal = await session.get(Principal, credential.principal_id)
+        if tenant is None or tenant.status != "active":
+            raise await deny("tenant_not_active")
+        if membership is None or membership.status != "active":
+            raise await deny("membership_not_active")
+        if principal is None or principal.status != "active":
+            raise await deny("principal_not_active")
+        return credential, principal
 
     @router.post(
         "/api/v1/tenants/{tenant_id}/principals/{principal_id}/authentication-contexts",
@@ -696,19 +760,9 @@ def create_platform_token_router(
         ограничения authority — и ни одного entitlement или доменного права.
         """
 
-        presented = parse_presented_credential(body.token)
-        credential = None
-        if presented is not None:
-            credential = await session.scalar(
-                select(PlatformAccessToken).where(
-                    PlatformAccessToken.public_prefix == presented.public_prefix,
-                    PlatformAccessToken.kind == presented.kind,
-                )
-            )
-        # Хэш считается всегда, в том числе для несуществующего prefix.
-        stored_hash = credential.secret_hash if credential is not None else _ABSENT_HASH
-        if not matches_stored_hash(body.token, stored_hash) or credential is None:
-            raise HTTPException(status_code=401, detail=_INVALID_TOKEN)
+        credential, principal = await resolve_presented(
+            session, body.token, action="platform_access_tokens.exchange"
+        )
 
         async def deny(status_code: int, detail: str, reason: str) -> HTTPException:
             session.add(
@@ -724,25 +778,6 @@ def create_platform_token_router(
             )
             await session.commit()
             return HTTPException(status_code=status_code, detail=detail)
-
-        expires_at = _as_aware(credential.expires_at)
-        if credential.revoked_at is not None:
-            raise await deny(401, _INVALID_TOKEN, "credential_revoked")
-        if expires_at is None or expires_at <= _now():
-            raise await deny(401, _INVALID_TOKEN, "credential_expired")
-
-        tenant = await session.get(Tenant, credential.tenant_id)
-        membership = await session.get(
-            TenantMembership,
-            {"tenant_id": credential.tenant_id, "principal_id": credential.principal_id},
-        )
-        principal = await session.get(Principal, credential.principal_id)
-        if tenant is None or tenant.status != "active":
-            raise await deny(401, _INVALID_TOKEN, "tenant_not_active")
-        if membership is None or membership.status != "active":
-            raise await deny(401, _INVALID_TOKEN, "membership_not_active")
-        if principal is None or principal.status != "active":
-            raise await deny(401, _INVALID_TOKEN, "principal_not_active")
 
         if body.audience not in credential.audiences:
             raise await deny(403, "audience_not_allowed", f"audience:{body.audience}")
@@ -801,5 +836,99 @@ def create_platform_token_router(
             scope=effective,
             session_id=session_id,
         )
+
+    @router.post(
+        "/api/v1/platform-access-tokens:introspect",
+        response_model=PlatformTokenIntrospection,
+        tags=["platform-access-tokens"],
+    )
+    async def introspect_platform_access_token(
+        body: PlatformTokenIntrospectRequest,
+        session: AsyncSession = Depends(get_session),
+    ) -> PlatformTokenIntrospection:
+        """Сообщить владельцу токена, кем он вошёл и до какого момента.
+
+        Обслуживает `iam auth status`: плагин видит identity и границы
+        authority, не получая ни одного audience credential. `last_used_at`
+        сознательно не трогается — это отметка о полученной authority, а не о
+        просмотре статуса.
+        """
+
+        credential, principal = await resolve_presented(
+            session, body.token, action="platform_access_tokens.introspect"
+        )
+        session.add(
+            AuditEvent(
+                tenant_id=credential.tenant_id,
+                action="platform_access_tokens.introspect",
+                actor_ref=str(credential.principal_id),
+                resource_type="platform_access_token",
+                resource_id=credential.id,
+                outcome="allowed",
+                reason=f"pat:{credential.public_prefix}",
+            )
+        )
+        await session.commit()
+        return PlatformTokenIntrospection(
+            tenant_id=credential.tenant_id,
+            principal_id=credential.principal_id,
+            principal_kind=principal.kind,
+            display_name=principal.display_name,
+            credential_id=credential.id,
+            name=credential.name,
+            public_prefix=credential.public_prefix,
+            audiences=list(credential.audiences),
+            scope_ceiling=list(credential.scope_ceiling),
+            expires_at=credential.expires_at,
+            issued_at=credential.created_at,
+        )
+
+    @router.post(
+        "/api/v1/platform-access-tokens:revoke-self",
+        status_code=204,
+        tags=["platform-access-tokens"],
+    )
+    async def revoke_presented_platform_access_token(
+        body: PlatformTokenSelfRevokeRequest,
+        session: AsyncSession = Depends(get_session),
+    ) -> Response:
+        """Отозвать предъявленный токен без bootstrap-полномочий.
+
+        `iam auth logout --revoke` обязан прекращать доступ немедленно, а не
+        только удалять локальную копию секрета. Владение секретом и есть
+        основание для отзыва: расширить authority эта операция не может.
+        Повторный вызов уже отозванным токеном не проходит resolve и отвечает
+        тем же `invalid_token` — endpoint не подтверждает существование
+        записи.
+        """
+
+        credential, _ = await resolve_presented(
+            session, body.token, action="platform_access_tokens.revoke"
+        )
+        credential.revoked_at = _now()
+        credential.revoked_by = str(credential.principal_id)
+        credential.revoke_reason = body.reason
+        session.add(
+            OutboxEvent(
+                tenant_id=credential.tenant_id,
+                type="credential.revoked",
+                aggregate_type="platform_access_token",
+                aggregate_id=credential.id,
+                payload={**_credential_payload(credential), "reason": body.reason},
+            )
+        )
+        session.add(
+            AuditEvent(
+                tenant_id=credential.tenant_id,
+                action="platform_access_tokens.revoke",
+                actor_ref=str(credential.principal_id),
+                resource_type="platform_access_token",
+                resource_id=credential.id,
+                outcome="allowed",
+                reason=f"pat:{credential.public_prefix} reason:{body.reason}",
+            )
+        )
+        await session.commit()
+        return Response(status_code=204)
 
     return router

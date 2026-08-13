@@ -124,6 +124,49 @@ class PlatformTokenExchangeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class PlatformTokenIntrospectRequest(BaseModel):
+    """Проверка предъявленного PAT без выпуска нового credential.
+
+    Нужна `iam auth status`: локальный плагин узнаёт, кем он вошёл и до
+    какого момента годится токен, не запрашивая доступ ни к одному audience.
+    """
+
+    token: str = Field(min_length=1)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PlatformTokenIntrospection(BaseModel):
+    """Несекретный снимок записи токена.
+
+    Секрет и его hash не возвращаются ни в каком виде: наружу выходят только
+    identity, границы authority и срок.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    tenant_id: uuid.UUID = Field(serialization_alias="tenantId")
+    principal_id: uuid.UUID = Field(serialization_alias="principalId")
+    principal_kind: str = Field(serialization_alias="principalKind")
+    display_name: str = Field(serialization_alias="displayName")
+    credential_id: uuid.UUID = Field(serialization_alias="credentialId")
+    name: str
+    public_prefix: str = Field(serialization_alias="publicPrefix")
+    audiences: list[str]
+    scope_ceiling: list[str] = Field(serialization_alias="scopeCeiling")
+    expires_at: datetime = Field(serialization_alias="expiresAt")
+    issued_at: datetime = Field(serialization_alias="issuedAt")
+
+
+class PlatformTokenSelfRevokeRequest(BaseModel):
+    """Отзыв предъявленного токена его же владельцем (`iam auth logout`)."""
+
+    token: str = Field(min_length=1)
+    reason: str = Field(default="logout", max_length=200)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class PlatformTokenExchangeResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

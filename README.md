@@ -140,6 +140,68 @@ credential. Хэш-функция у обоих сервисов одна, по�
 сервисов и не появляется в IAM ни на одном шаге. Импортированная запись
 обязана иметь ограниченный срок и не может быть выпущена бессрочно.
 
+## Вход локального harness: `iam auth`
+
+`iam_client` — reference-клиент для Codex, Claude Code и любого другого
+локального плагина. Он ставится рядом с harness, ходит по тем же публичным
+HTTP-контрактам, что и остальные клиенты, и не имеет доступа к базе IAM.
+
+```bash
+iam auth login                       # скрытый prompt; или `--stdin`
+iam auth status                      # кто вошёл, чем и до какого момента
+iam auth session --harness codex     # обмен токена и Harness Session
+iam auth logout --revoke             # локальный выход и отзыв в IAM
+```
+
+Секрет не проходит через argv ни при каких условиях: токен читается скрытым
+prompt или из stdin, а попытка передать его аргументом отклоняется до разбора
+команды — аргумент виден в истории оболочки и в таблице процессов, и одного
+его появления достаточно, чтобы считать credential скомпрометированным.
+
+### Привязка репозитория
+
+`.iam/binding.json` коммитится и содержит только несекретные metadata:
+
+```json
+{
+  "iamUrl": "https://iam.example",
+  "tenantId": "0f3f…",
+  "audience": "control-plane",
+  "controlPlaneUrl": "https://control-plane.example",
+  "scopes": ["read"]
+}
+```
+
+Файл проверяется на признаки credential — подозрительное имя поля или значение
+с префиксом `iam_pat_`/`cp_` отклоняет binding целиком. Непривязанный рабочий
+каталог получает отказ, а не credential соседнего проекта.
+
+### Где живёт секрет
+
+1. явно объявленный CI/runtime environment: `IAM_CREDENTIAL_MODE=environment`
+   плюс `IAM_PLATFORM_ACCESS_TOKEN`;
+2. OS credential store (macOS Keychain через `security`, секрет передаётся
+   только stdin);
+3. файл `$XDG_CONFIG_HOME/iam/credentials.json` с правами `0600` как fallback.
+
+Переменная окружения без объявленного режима — ошибка, а не тихий выбор
+источника: унаследованная переменная не должна незаметно подменять credential
+разработчика. Файл создаётся сразу с `0600`, а расширенные права при чтении
+считаются инцидентом и закрывают вход.
+
+### Harness Session
+
+`iam auth session` меняет PAT на короткоживущий token audience
+`control-plane` и открывает session уже в Control Plane. Codex и Claude Code
+предъявляют один и тот же Platform Access Token одного Principal, но каждый
+открывает собственную session со своим `harness_type`. `control_level` клиент
+не объявляет: Control Plane выводит `human_operated` из вида Principal,
+подтверждённого IAM-токеном.
+
+`logout` без флага удаляет только локальную копию — тот же токен мог быть
+сохранён на другой машине. `--revoke` отзывает его в IAM немедленно: обмен
+перестаёт работать сразу, а не после следующего цикла синхронизации.
+
 ## Быстрый запуск
 
 Создать локальный signing key, который не попадает в Git:
@@ -218,6 +280,8 @@ SCIM 2.0 API (confidential service identity):
 Credential и federation API:
 
 - `POST /api/v1/platform-access-tokens:exchange`;
+- `POST /api/v1/platform-access-tokens:introspect`;
+- `POST /api/v1/platform-access-tokens:revoke-self`;
 - `POST /api/v1/tokens/exchange`;
 - `POST /api/v1/tenants/{tenantId}/federation:authenticate`;
 - `GET /.well-known/jwks.json`.
@@ -225,6 +289,13 @@ Credential и federation API:
 `platform-access-tokens:exchange` не принимает `tenantId` и `principalId` от
 клиента: они берутся из записи предъявленного токена. Выданный access token не
 является credential и на этом endpoint отклоняется.
+
+`introspect` и `revoke-self` предъявляют тот же PAT телом запроса и проходят
+ту же проверку, что и обмен. `introspect` возвращает только identity, границы
+authority и срок — ни секрета, ни его hash. `revoke-self` даёт владельцу
+секрета отозвать свой токен без bootstrap-полномочий; расширить authority эта
+операция не может, а повторный вызов отозванным токеном отвечает тем же
+`invalid_token` и существование записи не подтверждает.
 
 `federation:authenticate` принимает только upstream token: поля `username` и
 `password` контрактом запрещены, пароль каталога проверяет исключительно IdP.
