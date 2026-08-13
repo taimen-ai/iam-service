@@ -35,22 +35,43 @@ class TokenIssuer:
         audience: str,
         scopes: list[str],
         credential_id: uuid.UUID,
+        principal_type: str = "service_account",
+        scope_ceiling: list[str] | None = None,
+        session_id: uuid.UUID | None = None,
+        auth_time: str | None = None,
+        acr: str | None = None,
     ) -> str:
+        """Выпустить access token одного audience.
+
+        Набор claims ограничен identity и ограничителями authority (ADR-0013):
+        ни entitlement, ни доменных permissions здесь быть не может — их
+        выдают entitlement-service и сам resource server.
+        """
+
         now = datetime.now(UTC)
+        claims: dict[str, Any] = {
+            "iss": self.issuer,
+            "sub": str(subject),
+            "tenant_id": str(tenant_id),
+            "aud": audience,
+            "scope": scopes,
+            "principal_type": principal_type,
+            "credential_id": str(credential_id),
+            "iat": now,
+            "nbf": now,
+            "exp": now + timedelta(seconds=self.ttl_seconds),
+            "jti": str(uuid.uuid4()),
+        }
+        if scope_ceiling is not None:
+            claims["scope_ceiling"] = scope_ceiling
+        if session_id is not None:
+            claims["session_id"] = str(session_id)
+        if auth_time is not None:
+            claims["auth_time"] = auth_time
+        if acr is not None:
+            claims["acr"] = acr
         return jwt.encode(
-            {
-                "iss": self.issuer,
-                "sub": str(subject),
-                "tenant_id": str(tenant_id),
-                "aud": audience,
-                "scope": scopes,
-                "principal_type": "service_account",
-                "credential_id": str(credential_id),
-                "iat": now,
-                "nbf": now,
-                "exp": now + timedelta(seconds=self.ttl_seconds),
-                "jti": str(uuid.uuid4()),
-            },
+            claims,
             self.private_key,
             algorithm="RS256",
             headers={"kid": self.key_id, "typ": "at+jwt"},

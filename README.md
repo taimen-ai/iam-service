@@ -42,8 +42,42 @@ Federation подтверждает identity и групповую проекц�
 Entitlement, audience credential или service-local role: доступ к ресурсу
 по-прежнему требует отдельных решений entitlement и domain policy.
 
-Не входят в этот срез: Platform Access Token человека, SCIM adapter,
-Entitlement Service, product licensing и service-local domain RBAC.
+Не входят в этот срез: SCIM adapter, Entitlement Service, product licensing и
+service-local domain RBAC.
+
+## Platform Access Token
+
+Principal-bound credential человека для Codex, Claude Code и других локальных
+плагинов. Предъявляется **только** IAM и обменивается на короткоживущий token
+одного audience — единый bearer для всех сервисов запрещён.
+
+- формат `iam_pat_<public-prefix>_<secret>`; сервер хранит lookup prefix и
+  SHA-256 полного токена, полный секрет показывается ровно один раз;
+- выпуск требует подтверждённого human authentication: свежесть считается по
+  серверному `recorded_at`, поэтому старый вход нельзя выдать за новый;
+- запись содержит name, audiences, scope ceiling, снимок authentication
+  context, expiry, last-used, revocation и предшественника при ротации;
+- `Idempotency-Key` обязателен при выпуске и ротации: повтор при ambiguous
+  response возвращает ту же запись с `token: null` и не создаёт второй
+  credential;
+- ротация меняет только секрет — она не продлевает окно и не расширяет
+  authority; предшественник отзывается в той же транзакции;
+- отключение Principal отзывает все его credentials, а обмен дополнительно
+  перепроверяет tenant, membership и статус Principal на каждом запросе;
+- любой дефект предъявленного токена даёт один и тот же `invalid_token`;
+  точная причина уходит только в audit, чтобы endpoint не был оракулом.
+
+Эффективные scopes — пересечение запрошенных, ceiling токена и allowlist
+audience. Ceiling только сужает authority: scope, отсутствующий в allowlist
+audience, не появится в token, даже если он записан в ceiling.
+
+### Compatibility window для Control Plane API key
+
+До cutover существующий ключ `cp_<prefix>_<secret>` остаётся рабочим
+credential. Хэш-функция у обоих сервисов одна, поэтому в IAM переносится
+только пара `(keyPrefix, keyHash)` — открытый ключ не пересекает границу
+сервисов и не появляется в IAM ни на одном шаге. Импортированная запись
+обязана иметь ограниченный срок и не может быть выпущена бессрочно.
 
 ## Быстрый запуск
 
@@ -102,13 +136,25 @@ Bootstrap management API:
 - `POST /api/v1/tenants/{tenantId}/audiences`;
 - `POST /api/v1/tenants/{tenantId}/service-accounts`;
 - `POST /api/v1/tenants/{tenantId}/service-accounts/{clientId}:revoke`;
+- `POST /api/v1/tenants/{tenantId}/principals/{principalId}:disable`;
+- `POST /api/v1/tenants/{tenantId}/principals/{principalId}/authentication-contexts`;
+- `POST /api/v1/tenants/{tenantId}/principals/{principalId}/platform-access-tokens`;
+- `GET /api/v1/tenants/{tenantId}/platform-access-tokens`;
+- `POST /api/v1/tenants/{tenantId}/platform-access-tokens/{credentialId}:rotate`;
+- `POST /api/v1/tenants/{tenantId}/platform-access-tokens/{credentialId}:revoke`;
+- `POST /api/v1/tenants/{tenantId}/legacy-credentials:import`;
 - `GET /api/v1/events`.
 
 Credential и federation API:
 
+- `POST /api/v1/platform-access-tokens:exchange`;
 - `POST /api/v1/tokens/exchange`;
 - `POST /api/v1/tenants/{tenantId}/federation:authenticate`;
 - `GET /.well-known/jwks.json`.
+
+`platform-access-tokens:exchange` не принимает `tenantId` и `principalId` от
+клиента: они берутся из записи предъявленного токена. Выданный access token не
+является credential и на этом endpoint отклоняется.
 
 `federation:authenticate` принимает только upstream token: поля `username` и
 `password` контрактом запрещены, пароль каталога проверяет исключительно IdP.
@@ -128,6 +174,9 @@ iss, sub, tenant_id, aud
 principal_type, credential_id
 scope, iat, nbf, exp, jti
 ```
+
+Token, выданный в обмен на Platform Access Token, дополнительно несёт
+`scope_ceiling`, `session_id`, `auth_time` и `acr`.
 
 Resource service обязан проверять RS256 signature, точные issuer и audience,
 временные claims и локальную revocation policy. `scope` является ceiling и не

@@ -44,6 +44,7 @@ from iam_service.models import (
     Tenant,
     TenantMembership,
 )
+from iam_service.pat import create_platform_token_router
 from iam_service.schemas import (
     AudienceCreate,
     AudienceView,
@@ -747,6 +748,14 @@ def create_app(
             await session.commit()
         return Response(status_code=204)
 
+    # Platform Access Token живёт в отдельном пакете и подключается целиком.
+    app.include_router(
+        create_platform_token_router(
+            settings=runtime_settings,
+            get_session=get_session,
+            require_bootstrap=require_bootstrap,
+        )
+    )
     return app
 
 

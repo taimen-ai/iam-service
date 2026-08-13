@@ -14,6 +14,13 @@ class Settings(BaseSettings):
     signing_private_key_file: str = ""
     signing_key_id: str = "local-dev"
     create_schema_on_startup: bool = False
+    # Platform Access Token: срок жизни самого PAT, потолок срока и предельный
+    # возраст human authentication, при котором ещё разрешён выпуск.
+    pat_default_ttl_seconds: int = 2592000
+    pat_max_ttl_seconds: int = 31536000
+    pat_max_authentication_age_seconds: int = 300
+    # Окно совместимости для перенесённых Control Plane API keys.
+    legacy_credential_max_ttl_seconds: int = 7776000
 
     def resolved_signing_private_key(self) -> str:
         if self.signing_private_key:
