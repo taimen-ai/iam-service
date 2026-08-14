@@ -30,7 +30,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 from iam_client.cli import EXIT_OK, EXIT_REMOTE, EXIT_UNAUTHENTICATED, EXIT_USAGE, Runtime, main
-from iam_client.store import CredentialStore, NullKeychain
+from iam_client.store import ENV_PRINCIPAL, CredentialStore, NullKeychain
 from iam_service.app import create_app
 from iam_service.config import Settings
 from iam_service.tokens import verify_access_token
@@ -165,15 +165,25 @@ class IamHarness:
         )
         return self.tenant_id
 
+    def add_principal(self, display_name: str, *, kind: str = "agent") -> str:
+        """Ещё один Principal того же тенанта — например второй исполнитель."""
+        principal = self.client.post(
+            f"/api/v1/tenants/{self.tenant_id}/principals",
+            headers=BOOTSTRAP,
+            json={"kind": kind, "displayName": display_name},
+        ).json()
+        return str(principal["id"])
+
     def issue(
         self,
         *,
         audiences: list[str] | None = None,
         scope_ceiling: list[str] | None = None,
         name: str = "workstation",
+        principal_id: str = "",
     ) -> str:
         response = self.client.post(
-            f"/api/v1/tenants/{self.tenant_id}/principals/{self.principal_id}"
+            f"/api/v1/tenants/{self.tenant_id}/principals/{principal_id or self.principal_id}"
             "/platform-access-tokens",
             headers={**BOOTSTRAP, "Idempotency-Key": str(uuid.uuid4())},
             json={
@@ -316,7 +326,9 @@ def test_login_keeps_the_secret_out_of_repository_and_output(workstation: Workst
     assert not (workstation.repository / ".iam" / "credentials.json").exists()
 
     stored = json.loads(workstation.credentials_path.read_text())
-    assert stored[f"{ISSUER}|{workstation.iam.tenant_id}"]["token"] == token
+    entry = stored[f"{ISSUER}|{workstation.iam.tenant_id}|{workstation.iam.principal_id}"]
+    assert entry["token"] == token
+    assert entry["principalId"] == workstation.iam.principal_id
     assert workstation.credentials_path.is_relative_to(workstation.config_home)
 
 
@@ -350,10 +362,15 @@ def test_os_credential_store_wins_over_file(workstation: Workstation) -> None:
     status = workstation.run("auth", "status", "--json")
 
     assert result.code == EXIT_OK, result.output
-    account = f"{ISSUER}|{workstation.iam.tenant_id}"
+    account = f"{ISSUER}|{workstation.iam.tenant_id}|{workstation.iam.principal_id}"
     assert keychain.entries[account] == token
-    # Пока доступен OS credential store, секрет вообще не попадает на диск.
-    assert not workstation.credentials_path.exists()
+    # Пока доступен OS credential store, секрет не попадает на диск: на нём
+    # остаётся только имя владельца — по нему процесс, не назвавший себя,
+    # узнаёт, что на машине есть чей-то credential и что он не один.
+    assert token not in workstation.credentials_path.read_text()
+    assert workstation.store().principals(f"{ISSUER}|{workstation.iam.tenant_id}") == [
+        workstation.iam.principal_id
+    ]
     assert json.loads(status.stdout)["credentialSource"] == "keychain"
 
     assert workstation.run("auth", "logout").code == EXIT_OK
@@ -651,3 +668,116 @@ def test_secret_never_reaches_process_arguments(workstation: Workstation) -> Non
 
     assert all(token not in " ".join(arguments) for arguments in recorded)
     assert os.environ.get("IAM_PLATFORM_ACCESS_TOKEN") is None
+
+
+# --- несколько исполнителей на одной машине ------------------------------------
+#
+# Пара `issuer|tenant` их не различает: под одним пользователем второй PAT
+# затирал бы первый, и агент молча ходил бы под чужой identity — видно это
+# только в audit, то есть поздно.
+
+
+def login_as(workstation: Workstation, token: str, principal_id: str) -> CliRun:
+    """Вход процесса, который объявил, кем он работает на этой машине."""
+    workstation.environ[ENV_PRINCIPAL] = principal_id
+    try:
+        return login(workstation, token)
+    finally:
+        workstation.environ.pop(ENV_PRINCIPAL, None)
+
+
+def test_two_executors_of_one_tenant_share_a_machine(workstation: Workstation) -> None:
+    """Ровно тот случай, ради которого разводили XDG_CONFIG_HOME руками."""
+    workstation.bind()
+    runner = workstation.iam.principal_id
+    reviewer = workstation.iam.add_principal("Codex Reviewer")
+    runner_token = workstation.iam.issue(name="runner")
+    reviewer_token = workstation.iam.issue(name="reviewer", principal_id=reviewer)
+
+    assert login_as(workstation, runner_token, runner).code == EXIT_OK
+    assert login_as(workstation, reviewer_token, reviewer).code == EXIT_OK
+
+    stored = json.loads(workstation.credentials_path.read_text())
+    account = f"{ISSUER}|{workstation.iam.tenant_id}"
+    # Обе записи живут в одном файле, под одним пользователем, без разведения путей.
+    assert stored[f"{account}|{runner}"]["token"] == runner_token
+    assert stored[f"{account}|{reviewer}"]["token"] == reviewer_token
+
+    workstation.environ[ENV_PRINCIPAL] = reviewer
+    status = json.loads(workstation.run("auth", "status", "--json").stdout)
+    assert status["principalId"] == reviewer, "процесс получил чужой credential"
+
+
+def test_second_login_does_not_overwrite_the_first(workstation: Workstation) -> None:
+    workstation.bind()
+    first = workstation.iam.principal_id
+    first_token = workstation.iam.issue(name="first")
+    login_as(workstation, first_token, first)
+
+    second = workstation.iam.add_principal("Second Executor")
+    login_as(workstation, workstation.iam.issue(name="second", principal_id=second), second)
+
+    workstation.environ[ENV_PRINCIPAL] = first
+    assert workstation.store().resolve(
+        f"{ISSUER}|{workstation.iam.tenant_id}", principal_id=first
+    ).token == first_token
+
+
+def test_a_process_that_does_not_say_who_it_is_gets_a_refusal_not_a_guess(
+    workstation: Workstation,
+) -> None:
+    """Молчаливый выбор одного из двух — это и есть подмена identity."""
+    workstation.bind()
+    login_as(workstation, workstation.iam.issue(name="first"), workstation.iam.principal_id)
+    second = workstation.iam.add_principal("Second Executor")
+    login_as(workstation, workstation.iam.issue(name="second", principal_id=second), second)
+
+    result = workstation.run("auth", "status")
+
+    assert result.code != EXIT_OK
+    assert "credential_ambiguous" in result.stderr
+    assert ENV_PRINCIPAL in result.stderr
+
+
+def test_one_executor_still_needs_no_declaration(workstation: Workstation) -> None:
+    """Машина с одним исполнителем работает ровно как раньше."""
+    workstation.bind()
+    login(workstation, workstation.iam.issue())
+
+    status = json.loads(workstation.run("auth", "status", "--json").stdout)
+
+    assert status["principalId"] == workstation.iam.principal_id
+
+
+def test_an_entry_of_the_old_format_is_still_read_and_then_migrated(
+    workstation: Workstation,
+) -> None:
+    """Файл, лежащий на машине с прошлого релиза, не требует ручного переноса."""
+    workstation.bind()
+    token = workstation.iam.issue()
+    account = f"{ISSUER}|{workstation.iam.tenant_id}"
+    workstation.credentials_path.parent.mkdir(parents=True, exist_ok=True)
+    workstation.credentials_path.write_text(json.dumps({account: {"token": token}}))
+    workstation.credentials_path.chmod(0o600)
+
+    status = json.loads(workstation.run("auth", "status", "--json").stdout)
+    assert status["principalId"] == workstation.iam.principal_id  # прочитан как раньше
+
+    login(workstation, token)  # повторный вход тем же токеном переносит запись
+    stored = json.loads(workstation.credentials_path.read_text())
+    assert account not in stored
+    assert stored[f"{account}|{workstation.iam.principal_id}"]["token"] == token
+
+
+def test_login_refuses_a_token_of_someone_other_than_declared(
+    workstation: Workstation,
+) -> None:
+    """Расхождение объявления и токена — отказ, а не запись под чужим ключом."""
+    workstation.bind()
+    other = workstation.iam.add_principal("Someone Else")
+
+    result = login_as(workstation, workstation.iam.issue(name="mine"), other)
+
+    assert result.code == EXIT_UNAUTHENTICATED
+    assert "principal_mismatch" in result.stderr
+    assert not workstation.credentials_path.exists()

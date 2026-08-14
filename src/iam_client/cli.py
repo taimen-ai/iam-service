@@ -27,7 +27,7 @@ from iam_client.binding import Binding, load_binding
 from iam_client.client import IamClient, Introspection
 from iam_client.errors import BindingError, CredentialError, IamClientError, RemoteError
 from iam_client.harness import SUPPORTED_HARNESS_TYPES, open_harness_session
-from iam_client.store import CredentialStore, ResolvedCredential
+from iam_client.store import ENV_PRINCIPAL, CredentialStore, ResolvedCredential
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -84,8 +84,18 @@ def _read_token(runtime: Runtime, *, from_stdin: bool) -> str:
     return prompt("Platform Access Token: ").strip()
 
 
+def _principal(runtime: Runtime) -> str:
+    """Кого из исполнителей этой машины обслуживает команда.
+
+    Пусто — «единственного»: пока на машине один credential пары, ничего
+    указывать не нужно. Как только их несколько, store откажется выбирать
+    вместо человека.
+    """
+    return runtime.environ.get(ENV_PRINCIPAL, "").strip()
+
+
 def _resolved(runtime: Runtime, binding: Binding) -> ResolvedCredential | None:
-    return runtime.store.resolve(binding.account)
+    return runtime.store.resolve(binding.account, principal_id=_principal(runtime))
 
 
 def _status_document(
@@ -142,10 +152,34 @@ def _command_login(runtime: Runtime, args: argparse.Namespace) -> int:
         )
         return EXIT_UNAUTHENTICATED
 
-    stored = runtime.store.store(binding.account, token)
+    declared = _principal(runtime)
+    if declared and declared != introspection.principal_id:
+        # Машина объявила, чей это процесс, а токен принадлежит другому: молча
+        # записать его — значит развести identity и объявление, а разойтись они
+        # могут надолго и заметно только в audit.
+        _fail(
+            runtime,
+            "principal_mismatch",
+            f"{ENV_PRINCIPAL} указывает на {declared}, "
+            f"а токен принадлежит {introspection.principal_id}",
+        )
+        return EXIT_UNAUTHENTICATED
+
+    stored = runtime.store.store(binding.account, token, principal_id=introspection.principal_id)
+    others = [
+        owner for owner in runtime.store.principals(binding.account) if owner != stored.principal_id
+    ]
     _emit(runtime, f"Вход выполнен: {introspection.display_name} ({introspection.principal_id})")
     _emit(runtime, f"Токен:      {redact(token)} ({introspection.name})")
     _emit(runtime, f"Хранилище:  {stored.source} → {stored.location}")
+    if others:
+        # Не предупреждение о проблеме, а факт: рядом живут чужие credential,
+        # поэтому процессам на этой машине нужно называть себя.
+        _emit(
+            runtime,
+            f"Рядом хранятся credential других Principal ({len(others)}): "
+            f"процессам укажите {ENV_PRINCIPAL}",
+        )
     _emit(runtime, f"Действует до: {introspection.expires_at.isoformat()}")
     return EXIT_OK
 
@@ -201,7 +235,10 @@ def _command_logout(runtime: Runtime, args: argparse.Namespace) -> int:
                 raise
             # Сервер уже не признаёт токен: локальную копию всё равно убираем.
 
-    removed = runtime.store.delete(binding.account)
+    removed = runtime.store.delete(
+        binding.account,
+        principal_id=_principal(runtime) or (credential.principal_id if credential else ""),
+    )
     if credential is not None and credential.source == "environment":
         _emit(runtime, "Credential задан окружением: удалить его локально нельзя")
     _emit(runtime, "Локальный credential удалён" if removed else "Локального credential не было")
