@@ -96,10 +96,12 @@ class Binding:
 
     @property
     def account(self) -> str:
-        """Ключ записи в credential store.
+        """Пара «IAM + tenant», по которой адресуется секрет.
 
         Один и тот же Principal может работать с несколькими IAM или
-        tenant'ами, поэтому секрет адресуется парой, а не одним URL.
+        tenant'ами, поэтому секрет адресуется парой, а не одним URL. Запись
+        внутри пары различается ещё и Principal — это делает `CredentialStore`,
+        которому пара передаётся целиком.
         """
 
         return f"{self.iam_url}|{self.tenant_id}"
