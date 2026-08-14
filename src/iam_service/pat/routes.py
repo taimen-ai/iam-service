@@ -58,6 +58,14 @@ from iam_service.tokens import TokenIssuer
 _INVALID_TOKEN = "invalid_token"
 _ABSENT_HASH = "0" * 64
 
+# Кто может держать Platform Access Token. Человек — потому что PAT задуман как
+# его вход из локального harness. Автономный агент — потому что он берёт работу
+# из очереди сам, под собственной identity, и внутри чужого Run не живёт; иначе
+# он был бы вынужден ходить credential'ом человека, и в audit эти двое перестали
+# бы различаться. Service account и workload остаются на client credentials:
+# у них есть свой поток, и размывать им границу PAT нечем.
+_PAT_PRINCIPAL_KINDS = frozenset({"human", "agent"})
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -258,6 +266,23 @@ def create_platform_token_router(
             "authTime": auth_time.isoformat(),
         }
 
+    async def credential_origin(
+        session: AsyncSession, tenant_id: uuid.UUID, principal: Principal, actor: str
+    ) -> dict[str, Any]:
+        """Снимок происхождения credential, который уходит в запись токена.
+
+        У человека это подтверждённый свежий вход: PAT не должен появляться вне
+        человеческой аутентификации (ADR-0012). У автономного агента такого
+        входа не существует и подделывать его нечем — его credential заводит
+        оператор bootstrap-операцией, и снимок честно фиксирует именно её, а не
+        имитирует человеческий `acr`/`amr`. Разница видна и в выданном access
+        token: `auth_time` и `acr` у агента отсутствуют.
+        """
+
+        if principal.kind == "human":
+            return await authentication_snapshot(session, tenant_id, principal)
+        return {"source": "agent_bootstrap", "issuedBy": actor, "recordedAt": _now().isoformat()}
+
     async def replayed(
         session: AsyncSession, tenant_id: uuid.UUID, idempotency_key: str
     ) -> PlatformAccessToken | None:
@@ -406,9 +431,9 @@ def create_platform_token_router(
             return issued(existing, None)
 
         principal = await active_member(session, tenant_id, principal_id)
-        if principal.kind != "human":
-            raise HTTPException(status_code=422, detail="human_principal_required")
-        context = await authentication_snapshot(session, tenant_id, principal)
+        if principal.kind not in _PAT_PRINCIPAL_KINDS:
+            raise HTTPException(status_code=422, detail="principal_kind_not_allowed")
+        context = await credential_origin(session, tenant_id, principal, actor)
         audiences = sorted(set(body.audiences))
         resolved = await known_audiences(session, tenant_id, audiences)
         ceiling = sorted(set(body.scope_ceiling))

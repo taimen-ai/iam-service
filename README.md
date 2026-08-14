@@ -108,14 +108,17 @@ IAM, `scim` использует native SCIM API Keycloak, `admin` — стаб�
 
 ## Platform Access Token
 
-Principal-bound credential человека для Codex, Claude Code и других локальных
-плагинов. Предъявляется **только** IAM и обменивается на короткоживущий token
-одного audience — единый bearer для всех сервисов запрещён.
+Principal-bound credential для Codex, Claude Code и других локальных плагинов.
+Предъявляется **только** IAM и обменивается на короткоживущий token одного
+audience — единый bearer для всех сервисов запрещён.
 
 - формат `iam_pat_<public-prefix>_<secret>`; сервер хранит lookup prefix и
   SHA-256 полного токена, полный секрет показывается ровно один раз;
-- выпуск требует подтверждённого human authentication: свежесть считается по
-  серверному `recorded_at`, поэтому старый вход нельзя выдать за новый;
+- держателем может быть Principal вида `human` или `agent`; service account и
+  workload остаются на client credentials;
+- выпуск человеку требует подтверждённого human authentication: свежесть
+  считается по серверному `recorded_at`, поэтому старый вход нельзя выдать за
+  новый;
 - запись содержит name, audiences, scope ceiling, снимок authentication
   context, expiry, last-used, revocation и предшественника при ротации;
 - `Idempotency-Key` обязателен при выпуске и ротации: повтор при ambiguous
@@ -127,6 +130,14 @@ Principal-bound credential человека для Codex, Claude Code и дру�
   перепроверяет tenant, membership и статус Principal на каждом запросе;
 - любой дефект предъявленного токена даёт один и тот же `invalid_token`;
   точная причина уходит только в audit, чтобы endpoint не был оракулом.
+
+Автономный агент берёт работу из очереди сам и внутри чужого Run не живёт,
+поэтому credential у него собственный, а не одолженный у оператора: иначе в
+audit работа человека и работа агента перестали бы различаться. Человеческого
+входа у агента нет, свежий authentication context с него не требуется — и выдать
+себя за человека он не может: снимок в записи говорит `agent_bootstrap`, а в
+выданном access token нет ни `auth_time`, ни `acr`, и `principal_type` равен
+`agent`.
 
 Эффективные scopes — пересечение запрошенных, ceiling токена и allowlist
 audience. Ceiling только сужает authority: scope, отсутствующий в allowlist

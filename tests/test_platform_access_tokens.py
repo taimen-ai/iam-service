@@ -210,14 +210,62 @@ def test_issuance_requires_fresh_human_authentication_context(harness: Harness) 
     never_authenticated = harness.create_principal()
     stale = harness.create_principal(name="Stale operator")
     harness.authenticate(stale, age_seconds=3600)
-    agent = harness.create_principal(kind="agent", name="Agent")
 
     assert harness.issue(never_authenticated).status_code == 403
     assert harness.issue(never_authenticated).json()["detail"] == "authentication_context_required"
     assert harness.issue(stale).json()["detail"] == "authentication_context_expired"
-    # PAT принадлежит человеку: service account'ы ходят по client credentials.
-    assert harness.issue(agent).json()["detail"] == "human_principal_required"
+
+
+def test_autonomous_agent_holds_its_own_credential(harness: Harness) -> None:
+    """Автономный исполнитель берёт работу сам, значит и credential у него свой.
+
+    Человеческого входа у агента нет, поэтому свежий authentication context с
+    него не требуется — но и выдать себя за человека он не может: снимок в
+    записи говорит `agent_bootstrap`, а в access token нет ни `auth_time`, ни
+    `acr`. Именно по `principal_type` resource service отличает работу агента
+    от работы оператора.
+    """
+
+    agent = harness.create_principal(kind="agent", name="Autonomous runner")
+
+    issued = harness.issue(agent, scope_ceiling=["read"])
+
+    assert issued.status_code == 201, issued.text
+    assert issued.json()["token"].startswith("iam_pat_")
+    credential_id = uuid.UUID(issued.json()["credential"]["id"])
+    with harness.session() as session:
+        credential = session.get(PlatformAccessToken, credential_id)
+        assert credential.authentication_context["source"] == "agent_bootstrap"
+    # Человеческий вход агенту зарегистрировать по-прежнему нельзя.
     assert harness.authenticate(agent).status_code == 422
+
+    exchanged = harness.exchange(issued.json()["token"], "control-plane")
+
+    assert exchanged.status_code == 200, exchanged.text
+    claims = harness.claims(exchanged.json()["accessToken"], "control-plane")
+    assert claims["principal_type"] == "agent"
+    assert "auth_time" not in claims
+    assert "acr" not in claims
+
+
+def test_service_account_does_not_get_a_platform_access_token(harness: Harness) -> None:
+    """У service account есть свой поток — client credentials, а не PAT."""
+
+    created = harness.client.post(
+        f"/api/v1/tenants/{harness.tenant_id}/service-accounts",
+        headers=BOOTSTRAP,
+        json={
+            "displayName": "CI",
+            "audiences": ["control-plane"],
+            "scopeCeiling": ["read"],
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    refused = harness.issue(created.json()["principalId"])
+
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == "principal_kind_not_allowed"
 
 
 def test_token_is_bound_to_one_audience_and_ceiling_only_narrows(harness: Harness) -> None:
