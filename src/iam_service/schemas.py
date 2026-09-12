@@ -122,6 +122,38 @@ class FederatedIdentityView(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class FederationExchangeRequest(BaseModel):
+    """Вход через upstream IdP плюс выпуск credential одного audience.
+
+    Нужен шлюзу, который действует от имени человека в браузере: у того есть
+    только upstream token, а не Platform Access Token. Тот же `extra="forbid"`,
+    что у `federation:authenticate`: пароль каталога сюда не попадает.
+    """
+
+    identity_provider: str = Field(alias="identityProvider", min_length=1, max_length=120)
+    token: str = Field(min_length=1)
+    audience: str = Field(min_length=1, max_length=120)
+    scopes: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
+class FederationExchangeResponse(BaseModel):
+    access_token: str = Field(alias="accessToken")
+    token_type: str = Field(alias="tokenType", default="Bearer")
+    expires_in: int = Field(alias="expiresIn")
+    audience: str
+    scope: list[str]
+    session_id: uuid.UUID = Field(alias="sessionId")
+    principal_id: uuid.UUID = Field(alias="principalId")
+    identity_provider: str = Field(alias="identityProvider")
+    groups: list[str]
+    authentication_context: FederationAuthenticationContext = Field(alias="authenticationContext")
+    identity_provider_stale: bool = Field(alias="identityProviderStale", default=False)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class AudienceCreate(BaseModel):
     key: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{1,118}[a-z0-9]$")
     allowed_scopes: list[str] = Field(alias="allowedScopes", default_factory=list)

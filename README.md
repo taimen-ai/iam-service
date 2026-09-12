@@ -39,8 +39,40 @@ Memory Service или другого продукта.
 - reference deployment Keycloak с LDAP User Federation в `deploy/keycloak`.
 
 Federation подтверждает identity и групповую проекцию. Она не выдаёт Product
-Entitlement, audience credential или service-local role: доступ к ресурсу
-по-прежнему требует отдельных решений entitlement и domain policy.
+Entitlement или service-local role: доступ к ресурсу по-прежнему требует
+отдельных решений entitlement и domain policy.
+
+### `federation:exchange` — вход и credential одним запросом
+
+`federation:authenticate` только подтверждает identity. Для человека в
+браузере этого мало: веб-консоль ходит в resource service через шлюз, а у
+шлюза есть лишь upstream token пользователя — Platform Access Token задуман
+для локального harness и через веб-сессию не проходит, а держать в шлюзе
+общий service credential означало бы потерять в audit самого человека.
+
+`POST /api/v1/tenants/{tenantId}/federation:exchange` делает всё то же, что
+`authenticate` (проверка upstream token по JWKS провайдера, linking, проекция
+групп, снимок authentication context), и сразу выпускает short-lived token
+одного audience: `{identityProvider, token, audience, scopes}` →
+`{accessToken, tokenType, expiresIn, audience, scope, sessionId, principalId,
+identityProvider, groups, authenticationContext}`.
+
+Отличия от обмена PAT:
+
+- собственного scope ceiling у веб-входа нет: потолок — allowlist audience,
+  запрошенные scopes обязаны в него входить, пустой список означает весь
+  allowlist; чужой audience — `403 audience_not_allowed`, чужой scope —
+  `403 scope_not_allowed`;
+- `credential_id` в token — id external identity: отключение identity
+  закрывает следующий обмен, а resource service получает стабильный ключ для
+  revocation-кэша;
+- выпуск открыт только Principal вида `human` (`422 human_principal_required`
+  для остальных): service account и workload остаются на client credentials.
+
+Форма token та же, что после обмена PAT (`principal_type`, `scope_ceiling`,
+`session_id`, `auth_time`, `acr`), поэтому resource service разницы не видит.
+Отказ по upstream token отвечает теми же кодами, что `authenticate`; в audit
+маршрут пишет `federation.exchange`, включая отказы по audience и scope.
 
 Не входят в этот срез: Entitlement Service, product licensing и service-local
 domain RBAC.
@@ -295,6 +327,7 @@ Credential и federation API:
 - `POST /api/v1/platform-access-tokens:revoke-self`;
 - `POST /api/v1/tokens/exchange`;
 - `POST /api/v1/tenants/{tenantId}/federation:authenticate`;
+- `POST /api/v1/tenants/{tenantId}/federation:exchange`;
 - `GET /.well-known/jwks.json`.
 
 `platform-access-tokens:exchange` не принимает `tenantId` и `principalId` от
@@ -327,8 +360,9 @@ principal_type, credential_id
 scope, iat, nbf, exp, jti
 ```
 
-Token, выданный в обмен на Platform Access Token, дополнительно несёт
-`scope_ceiling`, `session_id`, `auth_time` и `acr`.
+Token, выданный в обмен на Platform Access Token или через
+`federation:exchange`, дополнительно несёт `scope_ceiling`, `session_id`,
+`auth_time` и `acr`.
 
 Resource service обязан проверять RS256 signature, точные issuer и audience,
 временные claims и локальную revocation policy. `scope` является ceiling и не

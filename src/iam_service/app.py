@@ -5,6 +5,7 @@ import secrets
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from argon2 import PasswordHasher
@@ -20,12 +21,15 @@ from iam_service.federation import (
     FederationError,
     JsonFetcher,
     JwksResolver,
+    ResolvedJwks,
+    UpstreamClaims,
     ensure_authentication_context,
     project_groups,
     read_claims,
     verify_upstream_token,
 )
 from iam_service.federation.linking import (
+    LinkedIdentity,
     link_identity,
     reconcile_group_projection,
     touch_authentication,
@@ -45,6 +49,7 @@ from iam_service.models import (
     TenantMembership,
 )
 from iam_service.pat import create_platform_token_router, record_authentication_context
+from iam_service.pat.models import AuthenticationContext
 from iam_service.schemas import (
     AudienceCreate,
     AudienceView,
@@ -55,6 +60,8 @@ from iam_service.schemas import (
     FederatedIdentityView,
     FederationAuthenticateRequest,
     FederationAuthenticationContext,
+    FederationExchangeRequest,
+    FederationExchangeResponse,
     GroupCreate,
     GroupMemberCreate,
     GroupMemberView,
@@ -72,6 +79,30 @@ from iam_service.schemas import (
 )
 from iam_service.scim import UpstreamTransport, create_scim_router
 from iam_service.tokens import TokenIssuer
+
+
+@dataclass
+class FederationOutcome:
+    """Результат подтверждённого federation-входа до commit.
+
+    Собирает то, что обоим маршрутам нужно после linking: провайдера,
+    состояние JWKS, upstream claims, связанную identity, проекцию групп и
+    записанный снимок authentication context.
+    """
+
+    provider: IdentityProvider
+    resolved: ResolvedJwks
+    upstream: UpstreamClaims
+    linked: LinkedIdentity
+    groups: list[str]
+    context: AuthenticationContext
+
+    def authentication_context(self) -> FederationAuthenticationContext:
+        return FederationAuthenticationContext(
+            acr=self.upstream.context.acr,
+            amr=list(self.upstream.context.amr),
+            authTime=self.upstream.context.auth_time,
+        )
 
 
 def create_app(
@@ -109,14 +140,17 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/.well-known/jwks.json")
-    async def jwks() -> dict[str, list[dict[str, str]]]:
+    def token_issuer() -> TokenIssuer:
         return TokenIssuer(
             issuer=runtime_settings.issuer,
             private_key=runtime_settings.resolved_signing_private_key(),
             key_id=runtime_settings.signing_key_id,
             ttl_seconds=runtime_settings.token_ttl_seconds,
-        ).jwks()
+        )
+
+    @app.get("/.well-known/jwks.json")
+    async def jwks() -> dict[str, list[dict[str, str]]]:
+        return token_issuer().jwks()
 
     @app.post("/api/v1/tenants", response_model=TenantView, status_code=201)
     async def create_tenant(
@@ -363,24 +397,32 @@ def create_app(
             raise HTTPException(status_code=409, detail="identity_provider_exists") from exc
         return provider
 
-    @app.post(
-        "/api/v1/tenants/{tenant_id}/federation:authenticate",
-        response_model=FederatedIdentityView,
-    )
-    async def authenticate_federated_identity(
+    async def federate(
+        session: AsyncSession,
+        *,
         tenant_id: uuid.UUID,
-        body: FederationAuthenticateRequest,
-        session: AsyncSession = Depends(get_session),
-    ) -> FederatedIdentityView:
+        identity_provider: str,
+        token: str,
+        action: str,
+    ) -> FederationOutcome:
+        """Общая часть `federation:authenticate` и `federation:exchange`.
+
+        Проверка upstream token, linking, проекция групп и снимок
+        authentication context — одна и та же дорога независимо от того,
+        нужен ли клиенту после входа credential. Отказ уже записан в audit
+        под `action` и закоммичен; вызывающему остаётся положительная запись.
+        """
+
         provider = await session.scalar(
             select(IdentityProvider).where(
                 IdentityProvider.tenant_id == tenant_id,
-                IdentityProvider.key == body.identity_provider,
+                IdentityProvider.key == identity_provider,
                 IdentityProvider.status == "active",
             )
         )
         if provider is None:
             raise HTTPException(status_code=404, detail="identity_provider_not_found")
+        # После rollback ORM-объект провайдера недоступен, а audit его ещё ждёт.
         provider_id, provider_key = provider.id, provider.key
         try:
             resolved = await jwks_resolver.resolve(
@@ -391,7 +433,7 @@ def create_app(
                 stale_grace_seconds=provider.jwks_stale_grace_seconds,
             )
             claims = verify_upstream_token(
-                body.token,
+                token,
                 keys=resolved.keys,
                 issuer=provider.issuer,
                 audience=provider.audience,
@@ -424,7 +466,7 @@ def create_app(
             session.add(
                 AuditEvent(
                     tenant_id=tenant_id,
-                    action="federation.authenticate",
+                    action=action,
                     actor_ref=f"provider:{provider_key}",
                     resource_type="identity_provider",
                     resource_id=provider_id,
@@ -438,7 +480,7 @@ def create_app(
         touch_authentication(linked.identity, acr=upstream.context.acr)
         # Подтверждённый вход открывает человеку выпуск Platform Access Token:
         # снимок пишется в той же транзакции, что и linking.
-        record_authentication_context(
+        context = record_authentication_context(
             session,
             tenant_id=tenant_id,
             principal_id=linked.principal.id,
@@ -448,29 +490,161 @@ def create_app(
             auth_time=upstream.context.auth_time,
             external_identity_id=linked.identity.id,
         )
+        return FederationOutcome(
+            provider=provider,
+            resolved=resolved,
+            upstream=upstream,
+            linked=linked,
+            groups=groups,
+            context=context,
+        )
+
+    @app.post(
+        "/api/v1/tenants/{tenant_id}/federation:authenticate",
+        response_model=FederatedIdentityView,
+    )
+    async def authenticate_federated_identity(
+        tenant_id: uuid.UUID,
+        body: FederationAuthenticateRequest,
+        session: AsyncSession = Depends(get_session),
+    ) -> FederatedIdentityView:
+        outcome = await federate(
+            session,
+            tenant_id=tenant_id,
+            identity_provider=body.identity_provider,
+            token=body.token,
+            action="federation.authenticate",
+        )
+        acr = outcome.upstream.context.acr or "none"
         session.add(
             AuditEvent(
                 tenant_id=tenant_id,
                 action="federation.authenticate",
-                actor_ref=str(linked.principal.id),
+                actor_ref=str(outcome.linked.principal.id),
                 resource_type="external_identity",
-                resource_id=linked.identity.id,
+                resource_id=outcome.linked.identity.id,
                 outcome="allowed",
-                reason=f"provider:{provider.key} acr:{upstream.context.acr or 'none'}"
-                + (" jwks:stale" if resolved.stale else ""),
+                reason=f"provider:{outcome.provider.key} acr:{acr}"
+                + (" jwks:stale" if outcome.resolved.stale else ""),
             )
         )
         await session.commit()
         return FederatedIdentityView(
-            principalId=linked.principal.id,
-            identityProvider=provider.key,
-            groups=groups,
-            authenticationContext=FederationAuthenticationContext(
-                acr=upstream.context.acr,
-                amr=list(upstream.context.amr),
-                authTime=upstream.context.auth_time,
-            ),
-            identityProviderStale=resolved.stale,
+            principalId=outcome.linked.principal.id,
+            identityProvider=outcome.provider.key,
+            groups=outcome.groups,
+            authenticationContext=outcome.authentication_context(),
+            identityProviderStale=outcome.resolved.stale,
+        )
+
+    @app.post(
+        "/api/v1/tenants/{tenant_id}/federation:exchange",
+        response_model=FederationExchangeResponse,
+    )
+    async def exchange_federated_identity(
+        tenant_id: uuid.UUID,
+        body: FederationExchangeRequest,
+        session: AsyncSession = Depends(get_session),
+    ) -> FederationExchangeResponse:
+        """Вход через upstream IdP и сразу credential одного audience.
+
+        Для человека в браузере: у шлюза есть только его upstream token, а
+        Platform Access Token существует для локального harness и через
+        веб-сессию не проходит. Токен выпускается той же формы, что при обмене
+        PAT, — resource service отличий не видит. Потолок здесь — allowlist
+        audience: собственного ceiling у веб-входа нет.
+        """
+
+        outcome = await federate(
+            session,
+            tenant_id=tenant_id,
+            identity_provider=body.identity_provider,
+            token=body.token,
+            action="federation.exchange",
+        )
+        principal, identity = outcome.linked.principal, outcome.linked.identity
+        provider_key = outcome.provider.key
+
+        async def deny(status_code: int, detail: str) -> HTTPException:
+            # Вход состоялся и остаётся в базе: отказ относится к выпуску
+            # credential, а не к identity, и audit должен показывать оба факта.
+            session.add(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    action="federation.exchange",
+                    actor_ref=str(principal.id),
+                    resource_type="external_identity",
+                    resource_id=identity.id,
+                    outcome="denied",
+                    reason=f"provider:{provider_key} audience:{body.audience} {detail}",
+                )
+            )
+            await session.commit()
+            return HTTPException(status_code=status_code, detail=detail)
+
+        # Federation заводит только human Principal; сюда иной вид попадёт
+        # разве что через ручную привязку identity к service account — и это
+        # не дорога для client credentials.
+        if principal.kind != "human":
+            raise await deny(422, "human_principal_required")
+        audience = await session.scalar(
+            select(Audience).where(
+                Audience.tenant_id == tenant_id,
+                Audience.key == body.audience,
+                Audience.status == "active",
+            )
+        )
+        if audience is None:
+            raise await deny(403, "audience_not_allowed")
+        allowed = set(audience.allowed_scopes)
+        requested = set(body.scopes)
+        if not requested.issubset(allowed):
+            raise await deny(403, "scope_not_allowed")
+        # Пустой запрос означает «всё, что разрешено audience».
+        effective = sorted(requested or allowed)
+
+        session_id = uuid.uuid4()
+        token = token_issuer().issue(
+            subject=principal.id,
+            tenant_id=tenant_id,
+            audience=body.audience,
+            scopes=effective,
+            # Credential здесь — сама external identity: её отзыв (disable)
+            # закрывает и следующий обмен, а resource service получает
+            # стабильный ключ для своего revocation-кэша.
+            credential_id=identity.id,
+            principal_type=principal.kind,
+            scope_ceiling=sorted(allowed),
+            session_id=session_id,
+            # Тот же формат, что в снимке PAT: ISO 8601, серверная подрезка
+            # будущего `auth_time` уже применена в record_authentication_context.
+            auth_time=outcome.context.auth_time.isoformat(),
+            acr=outcome.context.acr,
+        )
+        session.add(
+            AuditEvent(
+                tenant_id=tenant_id,
+                action="federation.exchange",
+                actor_ref=str(principal.id),
+                resource_type="external_identity",
+                resource_id=identity.id,
+                outcome="allowed",
+                reason=f"provider:{provider_key} audience:{body.audience} session:{session_id}"
+                + (" jwks:stale" if outcome.resolved.stale else ""),
+            )
+        )
+        await session.commit()
+        return FederationExchangeResponse(
+            accessToken=token,
+            expiresIn=runtime_settings.token_ttl_seconds,
+            audience=body.audience,
+            scope=effective,
+            sessionId=session_id,
+            principalId=principal.id,
+            identityProvider=provider_key,
+            groups=outcome.groups,
+            authenticationContext=outcome.authentication_context(),
+            identityProviderStale=outcome.resolved.stale,
         )
 
     @app.post("/api/v1/tenants/{tenant_id}/audiences", response_model=AudienceView, status_code=201)
@@ -693,13 +867,7 @@ def create_app(
             audience.allowed_scopes
         ):
             raise HTTPException(status_code=403, detail="scope_not_allowed")
-        issuer = TokenIssuer(
-            issuer=runtime_settings.issuer,
-            private_key=runtime_settings.resolved_signing_private_key(),
-            key_id=runtime_settings.signing_key_id,
-            ttl_seconds=runtime_settings.token_ttl_seconds,
-        )
-        token = issuer.issue(
+        token = token_issuer().issue(
             subject=account.principal_id,
             tenant_id=account.tenant_id,
             audience=body.audience,
