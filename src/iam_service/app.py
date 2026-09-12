@@ -52,6 +52,7 @@ from iam_service.pat import create_platform_token_router, record_authentication_
 from iam_service.pat.models import AuthenticationContext
 from iam_service.schemas import (
     AudienceCreate,
+    AudienceUpdate,
     AudienceView,
     EventPage,
     EventView,
@@ -680,6 +681,70 @@ def create_app(
         except IntegrityError as exc:
             await session.rollback()
             raise HTTPException(status_code=409, detail="audience_exists") from exc
+        return audience
+
+    @app.get("/api/v1/tenants/{tenant_id}/audiences", response_model=list[AudienceView])
+    async def list_audiences(
+        tenant_id: uuid.UUID,
+        _: str = Depends(require_bootstrap),
+        session: AsyncSession = Depends(get_session),
+    ) -> list[Audience]:
+        if await session.get(Tenant, tenant_id) is None:
+            raise HTTPException(status_code=404, detail="tenant_not_found")
+        rows = await session.scalars(
+            select(Audience).where(Audience.tenant_id == tenant_id).order_by(Audience.key)
+        )
+        return list(rows)
+
+    @app.patch("/api/v1/tenants/{tenant_id}/audiences/{key}", response_model=AudienceView)
+    async def update_audience(
+        tenant_id: uuid.UUID,
+        key: str,
+        body: AudienceUpdate,
+        actor: str = Depends(require_bootstrap),
+        session: AsyncSession = Depends(get_session),
+    ) -> Audience:
+        """Заменить allowed scopes audience целиком (идемпотентно).
+
+        Потолок scope сервиса растёт вместе с сервисом (например, ``memory:tenants``
+        у memory-service); без этой операции уже заведённый audience можно было бы
+        расширить только SQL.
+        """
+        audience = await session.scalar(
+            select(Audience).where(Audience.tenant_id == tenant_id, Audience.key == key)
+        )
+        if audience is None:
+            raise HTTPException(status_code=404, detail="audience_not_found")
+        allowed_scopes = sorted(set(body.allowed_scopes))
+        if any(not scope or len(scope) > 120 for scope in allowed_scopes):
+            raise HTTPException(status_code=422, detail="invalid_scope")
+        if allowed_scopes != list(audience.allowed_scopes):
+            audience.allowed_scopes = allowed_scopes
+            session.add(
+                OutboxEvent(
+                    tenant_id=tenant_id,
+                    type="audience.updated",
+                    aggregate_type="audience",
+                    aggregate_id=audience.id,
+                    payload={
+                        "audienceId": str(audience.id),
+                        "key": audience.key,
+                        "allowedScopes": allowed_scopes,
+                    },
+                )
+            )
+            session.add(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    action="audiences.update",
+                    actor_ref=actor,
+                    resource_type="audience",
+                    resource_id=audience.id,
+                    outcome="allowed",
+                )
+            )
+            await session.commit()
+            await session.refresh(audience)
         return audience
 
     @app.post("/api/v1/tenants/{tenant_id}/groups", response_model=GroupView, status_code=201)

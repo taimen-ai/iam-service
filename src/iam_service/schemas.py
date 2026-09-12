@@ -159,6 +159,13 @@ class AudienceCreate(BaseModel):
     allowed_scopes: list[str] = Field(alias="allowedScopes", default_factory=list)
 
 
+class AudienceUpdate(BaseModel):
+    """Замена списка allowed scopes audience (bootstrap): новый scope появляется у
+    сервиса раньше, чем у уже заведённого audience."""
+
+    allowed_scopes: list[str] = Field(alias="allowedScopes")
+
+
 class AudienceView(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
