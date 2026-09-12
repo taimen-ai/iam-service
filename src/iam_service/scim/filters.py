@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from iam_service.scim.errors import ScimFault
 
 _TERM = re.compile(
-    r'^(?P<attribute>[A-Za-z][A-Za-z0-9_.]*)\s+(?P<operator>[A-Za-z]{2})\s+(?P<value>.+)$'
+    r"^(?P<attribute>[A-Za-z][A-Za-z0-9_.]*)\s+(?P<operator>[A-Za-z]{2})\s+(?P<value>.+)$"
 )
 
 
@@ -35,9 +35,7 @@ def parse_filter(expression: str, *, allowed: dict[str, str]) -> list[FilterTerm
             raise ScimFault(400, f"unsupported filter: {expression}", scim_type="invalidFilter")
         attribute = match.group("attribute")
         if match.group("operator").lower() != "eq":
-            raise ScimFault(
-                400, "only the eq operator is supported", scim_type="invalidFilter"
-            )
+            raise ScimFault(400, "only the eq operator is supported", scim_type="invalidFilter")
         if attribute not in allowed:
             raise ScimFault(
                 400, f"attribute {attribute} is not filterable", scim_type="invalidFilter"

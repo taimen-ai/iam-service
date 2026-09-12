@@ -78,8 +78,7 @@ def _assert_no_secrets(value: Any, path: str = "") -> None:
     if isinstance(value, str) and value.startswith(_SECRET_VALUE_PREFIXES):
         raise BindingError(
             "secret_in_binding",
-            f"значение {path or 'binding'} похоже на credential; "
-            "секрет не хранится в репозитории",
+            f"значение {path or 'binding'} похоже на credential; секрет не хранится в репозитории",
         )
 
 

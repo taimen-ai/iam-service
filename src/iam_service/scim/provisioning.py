@@ -165,9 +165,7 @@ class ProvisioningService:
         statement = self._user_scope()
         for term in terms:
             statement = statement.where(_criterion(ScimUser, term))
-        total = await self.session.scalar(
-            select(func.count()).select_from(statement.subquery())
-        )
+        total = await self.session.scalar(select(func.count()).select_from(statement.subquery()))
         rows = await self.session.scalars(
             statement.order_by(ScimUser.created_at, ScimUser.id)
             .offset(start_index - 1)
@@ -465,9 +463,7 @@ class ProvisioningService:
         statement = self._group_scope()
         for term in terms:
             statement = statement.where(_criterion(ScimGroup, term))
-        total = await self.session.scalar(
-            select(func.count()).select_from(statement.subquery())
-        )
+        total = await self.session.scalar(select(func.count()).select_from(statement.subquery()))
         rows = await self.session.scalars(
             statement.order_by(ScimGroup.created_at, ScimGroup.id)
             .offset(start_index - 1)
@@ -606,9 +602,7 @@ class ProvisioningService:
             self._audit("scim.groups.patch", "scim_group", group.id, f"group:{group.group_id}")
         return group
 
-    async def _patch_members(
-        self, group: ScimGroup, action: str, path: str, value: Any
-    ) -> bool:
+    async def _patch_members(self, group: ScimGroup, action: str, path: str, value: Any) -> bool:
         if action == "replace" and path == "members":
             return await self.replace_members(group, _member_values(value))
         if action == "add":

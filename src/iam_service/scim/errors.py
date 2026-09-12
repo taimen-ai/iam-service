@@ -32,9 +32,7 @@ class ScimFault(Exception):
         if self.scim_type is not None:
             payload["scimType"] = self.scim_type
         payload["detail"] = self.detail
-        return JSONResponse(
-            payload, status_code=self.status_code, media_type=SCIM_CONTENT_TYPE
-        )
+        return JSONResponse(payload, status_code=self.status_code, media_type=SCIM_CONTENT_TYPE)
 
 
 class ScimRoute(APIRoute):
@@ -54,7 +52,8 @@ class ScimRoute(APIRoute):
                 return fault.response()
             except RequestValidationError as exc:
                 return ScimFault(
-                    400, f"request does not match the SCIM schema: {exc.errors()[0]['loc']}",
+                    400,
+                    f"request does not match the SCIM schema: {exc.errors()[0]['loc']}",
                     scim_type="invalidValue",
                 ).response()
 

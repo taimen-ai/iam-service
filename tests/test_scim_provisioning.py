@@ -47,9 +47,7 @@ class FakeUpstream:
         road = "scim" if "/scim/v2/" in url else "admin"
         self.calls.append((road, method))
         if road == "scim":
-            return UpstreamResponse(
-                status_code=self.scim_status, payload={"id": "kc-scim-user"}
-            )
+            return UpstreamResponse(status_code=self.scim_status, payload={"id": "kc-scim-user"})
         return UpstreamResponse(
             status_code=self.admin_status,
             payload={},
@@ -95,7 +93,13 @@ class Harness:
         return tenant_id
 
     def create_identity_provider(
-        self, tenant_id: str, *, key: str, issuer: str, audience: str, jwks_uri: str,
+        self,
+        tenant_id: str,
+        *,
+        key: str,
+        issuer: str,
+        audience: str,
+        jwks_uri: str,
         lifecycle_profile: str = "managed",
     ) -> str:
         response = self.client.post(
@@ -329,14 +333,15 @@ def test_repeated_create_does_not_produce_a_second_principal(harness: Harness) -
 
 def test_filtering_and_pagination_are_bounded(harness: Harness) -> None:
     for index in range(3):
-        assert harness.create_user(
-            external_id=f"hr-{index}", user_name=f"user{index}@example.com"
-        ).status_code == 201
+        assert (
+            harness.create_user(
+                external_id=f"hr-{index}", user_name=f"user{index}@example.com"
+            ).status_code
+            == 201
+        )
 
     filtered = harness.scim("GET", '/scim/v2/Users?filter=userName eq "user1@example.com"')
-    combined = harness.scim(
-        "GET", '/scim/v2/Users?filter=externalId eq "hr-1" and active eq true'
-    )
+    combined = harness.scim("GET", '/scim/v2/Users?filter=externalId eq "hr-1" and active eq true')
     paged = harness.scim("GET", "/scim/v2/Users?startIndex=2&count=1")
     unsupported = harness.scim("GET", '/scim/v2/Users?filter=userName co "user"')
 
@@ -353,9 +358,7 @@ def test_filtering_and_pagination_are_bounded(harness: Harness) -> None:
 
 def test_deactivation_disables_principal_and_revokes_credentials(harness: Harness) -> None:
     user = harness.create_user(external_id="hr-1", user_name="ada@example.com").json()
-    principal_id = str(
-        harness.session().scalars(select(ScimUser)).one().principal_id
-    )
+    principal_id = str(harness.session().scalars(select(ScimUser)).one().principal_id)
     authenticated = harness.client.post(
         f"/api/v1/tenants/{harness.tenant_id}/principals/{principal_id}/authentication-contexts",
         headers=BOOTSTRAP,
@@ -439,9 +442,10 @@ def test_deprovisioning_removes_only_provisioned_mappings(harness: Harness) -> N
         json={"principalId": principal_id},
     )
 
-    assert harness.scim("GET", f"/scim/v2/Groups/{group['id']}").json()["members"][0][
-        "value"
-    ] == user["id"]
+    assert (
+        harness.scim("GET", f"/scim/v2/Groups/{group['id']}").json()["members"][0]["value"]
+        == user["id"]
+    )
     # Состав provisioned-группы задаёт source, а не локальный администратор.
     assert manual_into_provisioned.status_code == 409
     assert manual_into_provisioned.json()["detail"] == "group_is_federated"
@@ -526,13 +530,16 @@ def test_tenant_isolation(harness: Harness, idp) -> None:
         jwks_uri="https://idp.example/realms/other/certs",
     )
     principal_id, token = harness.service_identity(other_tenant, name="tenant-b-client")
-    assert harness.register_source(
-        other_tenant,
-        key="workforce-scim",
-        kind="scim",
-        identityProvider="workforce",
-        servicePrincipalId=principal_id,
-    ).status_code == 201
+    assert (
+        harness.register_source(
+            other_tenant,
+            key="workforce-scim",
+            kind="scim",
+            identityProvider="workforce",
+            servicePrincipalId=principal_id,
+        ).status_code
+        == 201
+    )
 
     listed = harness.scim("GET", "/scim/v2/Users", token=token)
     fetched = harness.scim("GET", f"/scim/v2/Users/{user['id']}", token=token)
@@ -541,9 +548,7 @@ def test_tenant_isolation(harness: Harness, idp) -> None:
     assert fetched.status_code == 404
 
 
-def test_upstream_driver_falls_back_to_admin_api_and_fails_closed(
-    tmp_path, idp, fetcher
-) -> None:
+def test_upstream_driver_falls_back_to_admin_api_and_fails_closed(tmp_path, idp, fetcher) -> None:
     upstream = FakeUpstream(scim_status=501)
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     private_pem = private_key.private_bytes(
@@ -573,16 +578,19 @@ def test_upstream_driver_falls_back_to_admin_api_and_fails_closed(
         principal_id, harness.token = harness.service_identity(
             harness.tenant_id, name="hr-scim-client"
         )
-        assert harness.register_source(
-            harness.tenant_id,
-            key="workforce-scim",
-            kind="scim",
-            identityProvider="workforce",
-            servicePrincipalId=principal_id,
-            upstreamMode="auto",
-            upstreamBaseUrl="https://kc.example",
-            upstreamRealm="platform",
-        ).status_code == 201
+        assert (
+            harness.register_source(
+                harness.tenant_id,
+                key="workforce-scim",
+                kind="scim",
+                identityProvider="workforce",
+                servicePrincipalId=principal_id,
+                upstreamMode="auto",
+                upstreamBaseUrl="https://kc.example",
+                upstreamRealm="platform",
+            ).status_code
+            == 201
+        )
 
         created = harness.create_user(external_id="hr-1", user_name="ada@example.com")
 

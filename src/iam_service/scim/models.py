@@ -53,9 +53,7 @@ class ProvisioningSource(Base):
         UniqueConstraint("service_principal_id", name="uq_provisioning_sources_service_principal"),
         CheckConstraint("kind IN ('scim', 'ldap')", name="kind"),
         CheckConstraint("status IN ('active', 'disabled')", name="status"),
-        CheckConstraint(
-            "upstream_mode IN ('off', 'scim', 'admin', 'auto')", name="upstream_mode"
-        ),
+        CheckConstraint("upstream_mode IN ('off', 'scim', 'admin', 'auto')", name="upstream_mode"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)

@@ -267,9 +267,7 @@ class Workstation:
 
     def repository_contents(self) -> str:
         return "\n".join(
-            path.read_text(errors="ignore")
-            for path in self.repository.rglob("*")
-            if path.is_file()
+            path.read_text(errors="ignore") for path in self.repository.rglob("*") if path.is_file()
         )
 
 
@@ -282,9 +280,7 @@ def signing_key_pair() -> tuple[str, str]:
     ).decode()
     public_pem = (
         private_key.public_key()
-        .public_bytes(
-            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-        )
+        .public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
         .decode()
     )
     return private_pem, public_pem
@@ -718,9 +714,12 @@ def test_second_login_does_not_overwrite_the_first(workstation: Workstation) -> 
     login_as(workstation, workstation.iam.issue(name="second", principal_id=second), second)
 
     workstation.environ[ENV_PRINCIPAL] = first
-    assert workstation.store().resolve(
-        f"{ISSUER}|{workstation.iam.tenant_id}", principal_id=first
-    ).token == first_token
+    assert (
+        workstation.store()
+        .resolve(f"{ISSUER}|{workstation.iam.tenant_id}", principal_id=first)
+        .token
+        == first_token
+    )
 
 
 def test_a_process_that_does_not_say_who_it_is_gets_a_refusal_not_a_guess(

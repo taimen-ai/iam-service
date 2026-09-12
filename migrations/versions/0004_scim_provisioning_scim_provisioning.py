@@ -67,9 +67,7 @@ def upgrade() -> None:
     with op.batch_alter_table("external_identities") as batch:
         batch.add_column(sa.Column("provisioning_source_id", sa.Uuid(), nullable=True))
         batch.drop_constraint("source", type_="check")
-        batch.create_check_constraint(
-            "source", "source IN ('manual', 'federated', 'provisioned')"
-        )
+        batch.create_check_constraint("source", "source IN ('manual', 'federated', 'provisioned')")
         batch.create_foreign_key(
             "fk_external_identities_provisioning_source",
             "provisioning_sources",

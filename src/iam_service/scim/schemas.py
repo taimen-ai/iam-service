@@ -17,9 +17,7 @@ USER_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:User"
 GROUP_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:Group"
 LIST_RESPONSE_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
 PATCH_OP_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:PatchOp"
-SERVICE_PROVIDER_CONFIG_SCHEMA = (
-    "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"
-)
+SERVICE_PROVIDER_CONFIG_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"
 
 
 class ScimUserRequest(BaseModel):
@@ -161,8 +159,10 @@ def service_provider_config() -> dict[str, Any]:
                 "primary": True,
             }
         ],
-        "meta": {"resourceType": "ServiceProviderConfig", "location": "/scim/v2/"
-                 "ServiceProviderConfig"},
+        "meta": {
+            "resourceType": "ServiceProviderConfig",
+            "location": "/scim/v2/ServiceProviderConfig",
+        },
     }
 
 

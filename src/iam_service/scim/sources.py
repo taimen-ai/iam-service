@@ -24,9 +24,7 @@ class ProvisioningSourceCreate(BaseModel):
     )
     upstream_base_url: str = Field(alias="upstreamBaseUrl", default="", max_length=500)
     upstream_realm: str = Field(alias="upstreamRealm", default="", max_length=120)
-    stale_after_seconds: int = Field(
-        alias="staleAfterSeconds", default=86400, ge=60, le=2592000
-    )
+    stale_after_seconds: int = Field(alias="staleAfterSeconds", default=86400, ge=60, le=2592000)
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 

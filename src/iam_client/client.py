@@ -125,9 +125,7 @@ class IamClient:
             issued_at=_parse_datetime(body["issuedAt"]),
         )
 
-    def exchange(
-        self, token: str, *, audience: str, scopes: Iterable[str] = ()
-    ) -> ExchangedToken:
+    def exchange(self, token: str, *, audience: str, scopes: Iterable[str] = ()) -> ExchangedToken:
         payload: dict[str, object] = {"token": token, "audience": audience}
         requested: Sequence[str] = sorted(set(scopes))
         if requested:
