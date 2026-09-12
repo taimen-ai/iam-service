@@ -7,6 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field
 class TenantCreate(BaseModel):
     slug: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,78}[a-z0-9]$")
     name: str = Field(min_length=1, max_length=200)
+    # Единый tenant платформы (суперпроект ADR-0030): id можно задать явно, чтобы
+    # IAM, Control Plane и platform-core именовали один tenant одним UUID.
+    id: uuid.UUID | None = None
 
 
 class TenantView(BaseModel):

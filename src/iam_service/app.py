@@ -160,6 +160,10 @@ def create_app(
         session: AsyncSession = Depends(get_session),
     ) -> Tenant:
         tenant = Tenant(slug=body.slug, name=body.name)
+        if body.id is not None:
+            if await session.get(Tenant, body.id) is not None:
+                raise HTTPException(status_code=409, detail="tenant_id_exists")
+            tenant.id = body.id
         session.add(tenant)
         await session.flush()
         session.add(
