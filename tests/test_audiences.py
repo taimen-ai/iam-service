@@ -1,5 +1,7 @@
 """Реестр audiences: список и замена allowed scopes (bootstrap-операции)."""
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 from iam_service.app import create_app
@@ -8,11 +10,21 @@ from iam_service.config import Settings
 BOOTSTRAP = {"X-IAM-Bootstrap-Token": "test-bootstrap-token"}
 
 
+def _private_pem() -> str:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+
 def _client(tmp_path) -> TestClient:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'iam.db'}",
         bootstrap_token="test-bootstrap-token",
         create_schema_on_startup=True,
+        signing_private_key=_private_pem(),
     )
     return TestClient(create_app(settings))
 
