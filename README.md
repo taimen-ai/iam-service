@@ -1,6 +1,6 @@
 # IAM Service
 
-*English. Русская версия: [README.ru.md](README.ru.md)*
+*English. Russian version: [README.ru.md](README.ru.md)*
 
 A product-neutral backend of unified identity for independently shipped and
 licensed resource services. IAM Service confirms the Principal and the Tenant,
