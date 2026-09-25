@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from iam_service.channels import create_channel_router
 from iam_service.config import Settings
 from iam_service.db import Database
 from iam_service.federation import (
@@ -1018,6 +1019,14 @@ def create_app(
             get_session=get_session,
             require_bootstrap=require_bootstrap,
             upstream_transport=upstream_transport,
+        )
+    )
+    # Канал как способ входа человека (Telegram) — отдельный пакет.
+    app.include_router(
+        create_channel_router(
+            settings=runtime_settings,
+            get_session=get_session,
+            require_bootstrap=require_bootstrap,
         )
     )
     return app

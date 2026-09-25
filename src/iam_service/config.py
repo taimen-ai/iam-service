@@ -26,6 +26,25 @@ class Settings(BaseSettings):
     scim_audience: str = "iam-scim"
     scim_scope: str = "scim:write"
     scim_max_page_size: int = 200
+    # Каналы как способ входа (Telegram): audience самого IAM, которому
+    # предъявляют токены человек и адаптер канала; scope адаптера; срок кода
+    # привязки и предельный возраст входа человека, создающего код.
+    channel_audience: str = "iam"
+    channel_scope: str = "iam:channel-links"
+    channel_link_code_ttl_seconds: int = 600
+    channel_link_max_authentication_age_seconds: int = 300
+    # Assertion канала обменивается ровно на один audience и один scope, срок
+    # токена — минута: это подтверждение одного решения, а не сессия.
+    channel_assertion_audience: str = "control-plane"
+    channel_assertion_scope: str = "control-plane:decide"
+    channel_assertion_ttl_seconds: int = 60
+    # Лимиты частоты: число событий в скользящем окне.
+    channel_link_intent_limit: int = 5
+    channel_link_intent_window_seconds: int = 600
+    channel_confirm_failure_limit: int = 10
+    channel_confirm_failure_window_seconds: int = 600
+    channel_assertion_limit: int = 10
+    channel_assertion_window_seconds: int = 60
 
     def resolved_signing_private_key(self) -> str:
         if self.signing_private_key:
