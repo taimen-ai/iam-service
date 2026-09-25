@@ -8,6 +8,7 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+from iam_service.channels import models as _channel_models  # noqa: F401
 from iam_service.models import Base
 from iam_service.pat import models as _platform_access_token_models  # noqa: F401
 

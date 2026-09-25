@@ -263,6 +263,81 @@ Principal confirmed by the IAM token.
 have been saved on another machine. `--revoke` revokes it in IAM immediately:
 the exchange stops working right away, not after the next synchronization cycle.
 
+## A channel as a login method (Telegram)
+
+A human can confirm a decision by replying in a messenger without opening the
+web console. The channel is an external identity provider enabled **per
+tenant**: `PUT /api/v1/tenants/{tenantId}/channel-providers/telegram` with
+`{"status": "active"|"disabled"}` (bootstrap). While there is no record or it is
+`disabled`, every step below is closed; the links themselves survive disabling.
+
+Three steps and three presenters, all with an IAM access token for the audience
+`IAM_CHANNEL_AUDIENCE` (default `iam`):
+
+1. **Link code.** A human with their own token (`principal_type=human`,
+   `auth_time` no older than `IAM_CHANNEL_LINK_MAX_AUTHENTICATION_AGE_SECONDS`,
+   300 s) calls `POST .../channel-link-intents` `{"channel": "telegram"}` and
+   receives a one-time code valid for 10 minutes (`channel_link_intents`: code
+   SHA-256, Principal, expiry, used-at). The code is shown once. An agent token
+   and a token issued by the channel itself (`acr=channel:*`) are rejected: only
+   a full login may open a new login method.
+2. **Confirmation.** The channel adapter, a service account with the scope
+   `iam:channel-links`, brings the code the human sent to the bot and the
+   account id: `POST .../channel-links:confirm`
+   `{"channel", "code", "externalSubject"}`. This creates an `ExternalIdentity`
+   with `source=channel` and issuer `iam:channel:telegram:{tenantId}`; the tenant
+   in the issuer keeps links of different tenants independent. Unknown, foreign
+   (another tenant), expired and used codes all answer `400 invalid_link_code`;
+   the exact reason goes to audit only.
+3. **Assertion exchange.** When the human replies to a notification, the adapter
+   calls `POST .../channel-assertions:exchange`
+   `{"channel", "externalSubject", "purposeRef"}` and receives a single-decision
+   token:
+
+   ```text
+   aud = IAM_CHANNEL_ASSERTION_AUDIENCE (control-plane)
+   scope = scope_ceiling = [IAM_CHANNEL_ASSERTION_SCOPE] (control-plane:decide)
+   principal_type = human, acr = channel:telegram, amr = [channel:telegram]
+   purpose_ref = purposeRef, credential_id = link id
+   exp - iat = IAM_CHANNEL_ASSERTION_TTL_SECONDS (60)
+   ```
+
+   Audience and scope come from configuration, not from the request; the
+   audience must be registered in the tenant and allow that scope. No
+   authentication context snapshot is written: the channel does not unlock
+   Platform Access Token issuance.
+
+Refusals: `403 channel_provider_disabled`, `404 channel_account_not_linked` (no
+link, or it was revoked), `403 principal_not_active`,
+`422 human_principal_required` (the link points to an agent),
+`403 audience_not_allowed`/`scope_not_allowed`, `409 channel_account_linked` (the
+account is linked to another human), `409 channel_already_linked` (the human
+already has a link for this channel), `403 service_account_required`,
+`403 scope_not_granted`, `403 tenant_mismatch`, `401 invalid_token` (including a
+revoked adapter service account, immediately rather than when its token
+expires).
+
+**Revocation.** A human lists their links with `GET .../channel-links` and
+revokes one with `POST .../channel-links/{linkId}:revoke`; someone else's link
+is indistinguishable from a missing one. The next exchange is closed, an already
+issued token lives at most a minute, and the `channel_link.revoked` event
+carries `credentialId` for revocation caches. Re-linking the same account
+revives the previous record.
+
+**Rate limits** are counted in the database (they survive restarts and are
+shared by replicas); a refusal is `429 rate_limited` with `Retry-After`: codes
+per Principal (`IAM_CHANNEL_LINK_INTENT_LIMIT`, 5 per 600 s), confirmation
+failures per adapter (`IAM_CHANNEL_CONFIRM_FAILURE_LIMIT`, 10 per 600 s),
+exchanges per link and exchange failures per adapter
+(`IAM_CHANNEL_ASSERTION_LIMIT`, 10 per 60 s).
+
+**Journal.** Outbox: `channel_provider.updated`, `channel_link_intent.created`,
+`channel_link.confirmed`, `channel_link.revoked`. Audit records every decision
+(`channel_providers.update`, `channel_link_intents.create`,
+`channel_links.confirm`, `channel_links.revoke`, `channel_assertions.exchange`,
+`channel_links.authenticate`) with the actor, the Principal and `purpose_ref`,
+but without the code or the channel account id.
+
 ## Quick start
 
 Create a local signing key that does not get into Git:
@@ -329,6 +404,8 @@ Bootstrap management API:
 - `POST /api/v1/tenants/{tenantId}/legacy-credentials:import`;
 - `POST /api/v1/tenants/{tenantId}/provisioning-sources`;
 - `GET /api/v1/tenants/{tenantId}/provisioning-sources`;
+- `PUT /api/v1/tenants/{tenantId}/channel-providers/{channel}`;
+- `GET /api/v1/tenants/{tenantId}/channel-providers`;
 - `GET /api/v1/events`.
 
 SCIM 2.0 API (confidential service identity):
@@ -347,6 +424,14 @@ Credential and federation API:
 - `POST /api/v1/tenants/{tenantId}/federation:authenticate`;
 - `POST /api/v1/tenants/{tenantId}/federation:exchange`;
 - `GET /.well-known/jwks.json`.
+
+Channel as a login method (IAM token of the human or of the channel adapter):
+
+- `POST /api/v1/tenants/{tenantId}/channel-link-intents`;
+- `GET /api/v1/tenants/{tenantId}/channel-links`;
+- `POST /api/v1/tenants/{tenantId}/channel-links/{linkId}:revoke`;
+- `POST /api/v1/tenants/{tenantId}/channel-links:confirm`;
+- `POST /api/v1/tenants/{tenantId}/channel-assertions:exchange`.
 
 `platform-access-tokens:exchange` does not accept `tenantId` and `principalId`
 from the client: they are taken from the record of the presented token. An
@@ -383,7 +468,9 @@ scope, iat, nbf, exp, jti
 
 A token issued in exchange for a Platform Access Token or via
 `federation:exchange` additionally carries `scope_ceiling`, `session_id`,
-`auth_time` and `acr`.
+`auth_time` and `acr`. A token issued for a channel assertion carries the same
+plus `amr` and `purpose_ref` and lives 60 seconds (see "A channel as a login
+method").
 
 A resource service must verify the RS256 signature, the exact issuer and
 audience, the time claims and its local revocation policy. `scope` is a ceiling

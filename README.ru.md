@@ -247,6 +247,77 @@ prompt или из stdin, а попытка передать его аргуме
 сохранён на другой машине. `--revoke` отзывает его в IAM немедленно: обмен
 перестаёт работать сразу, а не после следующего цикла синхронизации.
 
+## Канал как способ входа (Telegram)
+
+Человек может подтвердить решение ответом в мессенджере, не открывая веб-консоль.
+Канал — провайдер внешней identity, который включается **per tenant**:
+`PUT /api/v1/tenants/{tenantId}/channel-providers/telegram` с
+`{"status": "active"|"disabled"}` (bootstrap). Пока записи нет или она
+`disabled`, закрыты все шаги ниже; сами привязки при выключении сохраняются.
+
+Три шага и три предъявителя, все — access token IAM для audience
+`IAM_CHANNEL_AUDIENCE` (по умолчанию `iam`):
+
+1. **Код привязки.** Человек со своим token (`principal_type=human`, `auth_time`
+   не старше `IAM_CHANNEL_LINK_MAX_AUTHENTICATION_AGE_SECONDS`, 300 с) вызывает
+   `POST …/channel-link-intents` `{"channel": "telegram"}` и получает
+   одноразовый код на 10 минут (`channel_link_intents`: SHA-256 кода, Principal,
+   срок, отметка использования). Код показывается один раз. Token агента и
+   token, выданный по самому каналу (`acr=channel:*`), здесь отклоняются: новый
+   способ входа открывает только полноценный вход.
+2. **Подтверждение.** Адаптер канала — service account со scope
+   `iam:channel-links` — приносит код, который человек прислал боту, и id его
+   аккаунта: `POST …/channel-links:confirm`
+   `{"channel", "code", "externalSubject"}`. Появляется `ExternalIdentity` с
+   `source=channel` и issuer `iam:channel:telegram:{tenantId}` — tenant в issuer
+   держит привязки разных tenant независимыми. Неизвестный, чужой (другого
+   tenant), просроченный и использованный код отвечают одинаково
+   `400 invalid_link_code`; точная причина — только в audit.
+3. **Обмен assertion.** Когда человек отвечает на уведомление, адаптер вызывает
+   `POST …/channel-assertions:exchange`
+   `{"channel", "externalSubject", "purposeRef"}` и получает token одного
+   решения:
+
+   ```text
+   aud = IAM_CHANNEL_ASSERTION_AUDIENCE (control-plane)
+   scope = scope_ceiling = [IAM_CHANNEL_ASSERTION_SCOPE] (control-plane:decide)
+   principal_type = human, acr = channel:telegram, amr = [channel:telegram]
+   purpose_ref = purposeRef, credential_id = id привязки
+   exp - iat = IAM_CHANNEL_ASSERTION_TTL_SECONDS (60)
+   ```
+
+   Audience и scope задаёт конфигурация, а не запрос; audience обязан быть
+   зарегистрирован в tenant и разрешать этот scope. Снимок authentication
+   context не пишется: канал не открывает выпуск Platform Access Token.
+
+Отказы: `403 channel_provider_disabled`, `404 channel_account_not_linked`
+(нет привязки или она отозвана), `403 principal_not_active`,
+`422 human_principal_required` (привязка ведёт к агенту), `403
+audience_not_allowed`/`scope_not_allowed`, `409 channel_account_linked`
+(аккаунт привязан к другому человеку), `409 channel_already_linked` (у человека
+уже есть привязка этого канала), `403 service_account_required`,
+`403 scope_not_granted`, `403 tenant_mismatch`, `401 invalid_token` (в том числе
+отозванный service account адаптера — сразу, не дожидаясь срока его token).
+
+**Отзыв.** Человек видит свои привязки в `GET …/channel-links` и отзывает
+`POST …/channel-links/{linkId}:revoke`; чужая привязка неотличима от
+несуществующей. Следующий обмен закрыт, уже выданный token живёт не дольше
+минуты, событие `channel_link.revoked` несёт `credentialId` для
+revocation-кэшей. Повторная привязка того же аккаунта оживляет прежнюю запись.
+
+**Лимиты частоты** считаются по базе (переживают рестарт, общие для реплик),
+отказ — `429 rate_limited` с `Retry-After`: кодов на Principal
+(`IAM_CHANNEL_LINK_INTENT_LIMIT`, 5 за 600 с), отказов подтверждения на адаптер
+(`IAM_CHANNEL_CONFIRM_FAILURE_LIMIT`, 10 за 600 с), обменов на привязку и
+отказов обмена на адаптер (`IAM_CHANNEL_ASSERTION_LIMIT`, 10 за 60 с).
+
+**Журнал.** Outbox: `channel_provider.updated`, `channel_link_intent.created`,
+`channel_link.confirmed`, `channel_link.revoked`. Audit пишет каждое решение
+(`channel_providers.update`, `channel_link_intents.create`,
+`channel_links.confirm`, `channel_links.revoke`, `channel_assertions.exchange`,
+`channel_links.authenticate`) с актором, Principal и `purpose_ref`, но без кода
+и id аккаунта в канале.
+
 ## Быстрый запуск
 
 Создать локальный signing key, который не попадает в Git:
@@ -313,6 +384,8 @@ Bootstrap management API:
 - `POST /api/v1/tenants/{tenantId}/legacy-credentials:import`;
 - `POST /api/v1/tenants/{tenantId}/provisioning-sources`;
 - `GET /api/v1/tenants/{tenantId}/provisioning-sources`;
+- `PUT /api/v1/tenants/{tenantId}/channel-providers/{channel}`;
+- `GET /api/v1/tenants/{tenantId}/channel-providers`;
 - `GET /api/v1/events`.
 
 SCIM 2.0 API (confidential service identity):
@@ -331,6 +404,14 @@ Credential и federation API:
 - `POST /api/v1/tenants/{tenantId}/federation:authenticate`;
 - `POST /api/v1/tenants/{tenantId}/federation:exchange`;
 - `GET /.well-known/jwks.json`.
+
+Канал как способ входа (token IAM человека или адаптера канала):
+
+- `POST /api/v1/tenants/{tenantId}/channel-link-intents`;
+- `GET /api/v1/tenants/{tenantId}/channel-links`;
+- `POST /api/v1/tenants/{tenantId}/channel-links/{linkId}:revoke`;
+- `POST /api/v1/tenants/{tenantId}/channel-links:confirm`;
+- `POST /api/v1/tenants/{tenantId}/channel-assertions:exchange`.
 
 `platform-access-tokens:exchange` не принимает `tenantId` и `principalId` от
 клиента: они берутся из записи предъявленного токена. Выданный access token не
@@ -364,7 +445,8 @@ scope, iat, nbf, exp, jti
 
 Token, выданный в обмен на Platform Access Token или через
 `federation:exchange`, дополнительно несёт `scope_ceiling`, `session_id`,
-`auth_time` и `acr`.
+`auth_time` и `acr`. Token, выданный по assertion канала, несёт их же плюс
+`amr` и `purpose_ref` и живёт 60 секунд (см. «Канал как способ входа»).
 
 Resource service обязан проверять RS256 signature, точные issuer и audience,
 временные claims и локальную revocation policy. `scope` является ceiling и не

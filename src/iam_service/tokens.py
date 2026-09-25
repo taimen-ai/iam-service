@@ -40,15 +40,20 @@ class TokenIssuer:
         session_id: uuid.UUID | None = None,
         auth_time: str | None = None,
         acr: str | None = None,
+        amr: list[str] | None = None,
+        purpose_ref: str | None = None,
+        ttl_seconds: int | None = None,
     ) -> str:
         """Выпустить access token одного audience.
 
         Набор claims ограничен identity и ограничителями authority (ADR-0013):
         ни entitlement, ни доменных permissions здесь быть не может — их
-        выдают entitlement-service и сам resource server.
+        выдают entitlement-service и сам resource server. `ttl_seconds`
+        только укорачивает срок относительно настроенного по умолчанию.
         """
 
         now = datetime.now(UTC)
+        lifetime = min(ttl_seconds or self.ttl_seconds, self.ttl_seconds)
         claims: dict[str, Any] = {
             "iss": self.issuer,
             "sub": str(subject),
@@ -59,7 +64,7 @@ class TokenIssuer:
             "credential_id": str(credential_id),
             "iat": now,
             "nbf": now,
-            "exp": now + timedelta(seconds=self.ttl_seconds),
+            "exp": now + timedelta(seconds=lifetime),
             "jti": str(uuid.uuid4()),
         }
         if scope_ceiling is not None:
@@ -70,6 +75,10 @@ class TokenIssuer:
             claims["auth_time"] = auth_time
         if acr is not None:
             claims["acr"] = acr
+        if amr is not None:
+            claims["amr"] = amr
+        if purpose_ref is not None:
+            claims["purpose_ref"] = purpose_ref
         return jwt.encode(
             claims,
             self.private_key,

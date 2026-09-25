@@ -115,7 +115,9 @@ class ExternalIdentity(Base):
             name="uq_external_identities_provider_external_id",
         ),
         CheckConstraint("status IN ('active', 'disabled')", name="status"),
-        CheckConstraint("source IN ('manual', 'federated', 'provisioned')", name="source"),
+        CheckConstraint(
+            "source IN ('manual', 'federated', 'provisioned', 'channel')", name="source"
+        ),
         Index("ix_external_identities_principal", "principal_id"),
     )
 
@@ -245,6 +247,8 @@ class OutboxEvent(Base):
 
 class AuditEvent(Base):
     __tablename__ = "audit_events"
+    # Лимиты частоты каналов считают недавние записи по действию и tenant.
+    __table_args__ = (Index("ix_audit_events_action", "tenant_id", "action", "occurred_at"),)
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("tenants.id"))
