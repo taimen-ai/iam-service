@@ -154,7 +154,7 @@ class IamHarness:
         principal = self.client.post(
             f"/api/v1/tenants/{self.tenant_id}/principals",
             headers=BOOTSTRAP,
-            json={"kind": "human", "displayName": "Aleksandr Operator"},
+            json={"kind": "human", "displayName": "Platform Operator"},
         ).json()
         self.principal_id = principal["id"]
         self.client.post(
