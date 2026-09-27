@@ -190,6 +190,34 @@ and the audience allowlist. The ceiling only narrows authority: a scope absent
 from the audience allowlist will not appear in the token even if it is written
 in the ceiling.
 
+### Agents of a service account: scope `iam:agents`
+
+An agent controller (for example, the declarative agents reconciler) creates
+agents and issues PATs to them **without the bootstrap token**, using its own
+IAM token: a confidential service account, audience `IAM_AGENTS_AUDIENCE`
+(default `iam`), scope `IAM_AGENTS_SCOPE` (`iam:agents`). Bootstrap is needed
+once — to create the service account itself with this scope.
+
+- `POST /api/v1/tenants/{tenantId}/agents` `{"displayName"}` — a Principal of
+  kind `agent` whose owner (`ownerPrincipalId`) is the calling service account;
+- `POST …/agents/{agentId}/platform-access-tokens`
+  `{"name", "audiences", "scopeCeiling", "expiresInSeconds"}` with a mandatory
+  `Idempotency-Key` — the agent's PAT; the expiry is mandatory and at most
+  `IAM_AGENT_PAT_MAX_TTL_SECONDS` (7 days);
+- `POST …/agents/{agentId}/platform-access-tokens/{credentialId}:revoke` —
+  revocation; the next exchange gets `401 invalid_token`.
+
+Only one's own agents can be managed: someone else's agent (and an ownerless
+agent created by bootstrap) — `403 agent_not_owned`, a principal of another
+kind — `422 agent_principal_required`; both refusals are audited. The agent's
+authority never exceeds the owner's: the PAT audiences and ceiling are a subset
+of the service account's audiences and ceiling
+(`422 audience_not_delegable`/`scope_not_delegable`), and `iam:agents` itself is
+not delegable. The snapshot in the PAT record is `agent_owner` with the owner;
+the agent's access token has neither `auth_time` nor `acr`. Revoking the service
+account closes this path immediately rather than when its token expires. The
+decision is [ADR-0001](docs/adr/0001-iam-agents-scope.md).
+
 ### Compatibility window for the Control Plane API key
 
 Until the cutover, the existing `cp_<prefix>_<secret>` key remains a working
@@ -432,6 +460,12 @@ Channel as a login method (IAM token of the human or of the channel adapter):
 - `POST /api/v1/tenants/{tenantId}/channel-links/{linkId}:revoke`;
 - `POST /api/v1/tenants/{tenantId}/channel-links:confirm`;
 - `POST /api/v1/tenants/{tenantId}/channel-assertions:exchange`.
+
+Agents of an owner (IAM token of a service account with scope `iam:agents`):
+
+- `POST /api/v1/tenants/{tenantId}/agents`;
+- `POST /api/v1/tenants/{tenantId}/agents/{agentId}/platform-access-tokens`;
+- `POST /api/v1/tenants/{tenantId}/agents/{agentId}/platform-access-tokens/{credentialId}:revoke`.
 
 `platform-access-tokens:exchange` does not accept `tenantId` and `principalId`
 from the client: they are taken from the record of the presented token. An

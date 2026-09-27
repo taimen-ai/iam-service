@@ -16,7 +16,9 @@ from iam_service.pat.material import (
 from iam_service.pat.models import AuthenticationContext, PlatformAccessToken
 from iam_service.pat.routes import (
     create_platform_token_router,
+    credential_payload,
     record_authentication_context,
+    revoke_credential,
     revoke_tokens_for_principal,
 )
 
@@ -27,9 +29,11 @@ __all__ = [
     "PlatformAccessToken",
     "PresentedCredential",
     "create_platform_token_router",
+    "credential_payload",
     "generate_platform_access_token",
     "hash_credential",
     "parse_presented_credential",
     "record_authentication_context",
+    "revoke_credential",
     "revoke_tokens_for_principal",
 ]

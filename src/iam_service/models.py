@@ -46,12 +46,19 @@ class Principal(Base):
     __table_args__ = (
         CheckConstraint("kind IN ('human', 'agent', 'service_account', 'workload')", name="kind"),
         CheckConstraint("status IN ('active', 'paused', 'disabled')", name="status"),
+        Index("ix_principals_owner", "owner_principal_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     kind: Mapped[str] = mapped_column(String(30))
     display_name: Mapped[str] = mapped_column(String(200))
     status: Mapped[str] = mapped_column(String(20), default="active")
+    # Владелец агента — service account, который его завёл по scope
+    # `iam:agents`; только владелец выпускает и отзывает credentials агента.
+    # У principal, заведённых bootstrap-операцией, владельца нет.
+    owner_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("principals.id", name="fk_principals_owner"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
