@@ -79,7 +79,7 @@ def _as_aware(value: datetime | None) -> datetime | None:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-def _credential_payload(credential: PlatformAccessToken) -> dict[str, Any]:
+def credential_payload(credential: PlatformAccessToken) -> dict[str, Any]:
     """Payload события: идентификаторы и prefix, никогда не секрет."""
 
     return {
@@ -153,32 +153,44 @@ async def revoke_tokens_for_principal(
             )
         )
     )
-    revoked_at = _now()
     for credential in credentials:
-        credential.revoked_at = revoked_at
-        credential.revoked_by = actor
-        credential.revoke_reason = reason
-        session.add(
-            OutboxEvent(
-                tenant_id=tenant_id,
-                type="credential.revoked",
-                aggregate_type="platform_access_token",
-                aggregate_id=credential.id,
-                payload={**_credential_payload(credential), "reason": reason},
-            )
-        )
-        session.add(
-            AuditEvent(
-                tenant_id=tenant_id,
-                action="platform_access_tokens.revoke",
-                actor_ref=actor,
-                resource_type="platform_access_token",
-                resource_id=credential.id,
-                outcome="allowed",
-                reason=f"pat:{credential.public_prefix} reason:{reason}",
-            )
-        )
+        revoke_credential(session, credential, actor=actor, reason=reason)
     return len(credentials)
+
+
+def revoke_credential(
+    session: AsyncSession, credential: PlatformAccessToken, *, actor: str, reason: str
+) -> None:
+    """Отозвать один действующий credential: отметка, событие и audit.
+
+    Общая часть всех путей отзыва — bootstrap-операции, deprovisioning и
+    владельца агента. Следующий обмен credential получает `invalid_token`.
+    Коммит остаётся за вызывающим кодом.
+    """
+
+    credential.revoked_at = _now()
+    credential.revoked_by = actor
+    credential.revoke_reason = reason
+    session.add(
+        OutboxEvent(
+            tenant_id=credential.tenant_id,
+            type="credential.revoked",
+            aggregate_type="platform_access_token",
+            aggregate_id=credential.id,
+            payload={**credential_payload(credential), "reason": reason},
+        )
+    )
+    session.add(
+        AuditEvent(
+            tenant_id=credential.tenant_id,
+            action="platform_access_tokens.revoke",
+            actor_ref=actor,
+            resource_type="platform_access_token",
+            resource_id=credential.id,
+            outcome="allowed",
+            reason=f"pat:{credential.public_prefix} reason:{reason}",
+        )
+    )
 
 
 def create_platform_token_router(
@@ -467,7 +479,7 @@ def create_platform_token_router(
                     type="platform_access_token.issued",
                     aggregate_type="platform_access_token",
                     aggregate_id=credential.id,
-                    payload=_credential_payload(credential),
+                    payload=credential_payload(credential),
                 )
             )
             session.add(
@@ -531,29 +543,7 @@ def create_platform_token_router(
         if credential is None:
             raise HTTPException(status_code=404, detail="credential_not_found")
         if credential.revoked_at is None:
-            credential.revoked_at = _now()
-            credential.revoked_by = actor
-            credential.revoke_reason = reason
-            session.add(
-                OutboxEvent(
-                    tenant_id=tenant_id,
-                    type="credential.revoked",
-                    aggregate_type="platform_access_token",
-                    aggregate_id=credential.id,
-                    payload={**_credential_payload(credential), "reason": reason},
-                )
-            )
-            session.add(
-                AuditEvent(
-                    tenant_id=tenant_id,
-                    action="platform_access_tokens.revoke",
-                    actor_ref=actor,
-                    resource_type="platform_access_token",
-                    resource_id=credential.id,
-                    outcome="allowed",
-                    reason=f"pat:{credential.public_prefix} reason:{reason}",
-                )
-            )
+            revoke_credential(session, credential, actor=actor, reason=reason)
             await session.commit()
         return Response(status_code=204)
 
@@ -621,7 +611,7 @@ def create_platform_token_router(
                     aggregate_type="platform_access_token",
                     aggregate_id=successor.id,
                     payload={
-                        **_credential_payload(successor),
+                        **credential_payload(successor),
                         "rotatedFromId": str(previous.id),
                         "rotatedFromPrefix": previous.public_prefix,
                     },
@@ -699,7 +689,7 @@ def create_platform_token_router(
                     type="legacy_credential.imported",
                     aggregate_type="platform_access_token",
                     aggregate_id=credential.id,
-                    payload=_credential_payload(credential),
+                    payload=credential_payload(credential),
                 )
             )
             session.add(
@@ -939,7 +929,7 @@ def create_platform_token_router(
                 type="credential.revoked",
                 aggregate_type="platform_access_token",
                 aggregate_id=credential.id,
-                payload={**_credential_payload(credential), "reason": body.reason},
+                payload={**credential_payload(credential), "reason": body.reason},
             )
         )
         session.add(

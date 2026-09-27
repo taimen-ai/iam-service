@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from iam_service.agents import create_agent_router
 from iam_service.channels import create_channel_router
 from iam_service.config import Settings
 from iam_service.db import Database
@@ -1029,6 +1030,8 @@ def create_app(
             require_bootstrap=require_bootstrap,
         )
     )
+    # Агенты service account'а со scope `iam:agents` — без bootstrap-токена.
+    app.include_router(create_agent_router(settings=runtime_settings, get_session=get_session))
     return app
 
 

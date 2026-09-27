@@ -177,6 +177,33 @@ audit работа человека и работа агента переста�
 audience. Ceiling только сужает authority: scope, отсутствующий в allowlist
 audience, не появится в token, даже если он записан в ceiling.
 
+### Агенты service account: scope `iam:agents`
+
+Контроллер агентов (например, reconciler декларативных агентов) заводит агентов
+и выпускает им PAT **без bootstrap-токена** — по своему token IAM:
+confidential service account, audience `IAM_AGENTS_AUDIENCE` (по умолчанию
+`iam`), scope `IAM_AGENTS_SCOPE` (`iam:agents`). Bootstrap нужен один раз —
+завести сам service account с этим scope.
+
+- `POST /api/v1/tenants/{tenantId}/agents` `{"displayName"}` — Principal вида
+  `agent`, владелец (`ownerPrincipalId`) — вызывающий service account;
+- `POST …/agents/{agentId}/platform-access-tokens`
+  `{"name", "audiences", "scopeCeiling", "expiresInSeconds"}` с обязательным
+  `Idempotency-Key` — PAT агента; срок обязателен и не больше
+  `IAM_AGENT_PAT_MAX_TTL_SECONDS` (7 суток);
+- `POST …/agents/{agentId}/platform-access-tokens/{credentialId}:revoke` —
+  отзыв; следующий обмен получает `401 invalid_token`.
+
+Работать можно только со своими агентами: чужой агент (и агент без владельца,
+заведённый bootstrap) — `403 agent_not_owned`, principal другого вида —
+`422 agent_principal_required`; оба отказа пишутся в audit. Authority агента не
+шире authority владельца: audiences и потолок PAT — подмножество audiences и
+потолка service account (`422 audience_not_delegable`/`scope_not_delegable`), а
+сам `iam:agents` не делегируется. Снимок в записи PAT — `agent_owner` с
+владельцем; в access token агента нет ни `auth_time`, ни `acr`. Отзыв service
+account закрывает этот путь сразу, не дожидаясь истечения его token. Решение —
+[ADR-0001](docs/adr/0001-iam-agents-scope.md).
+
 ### Compatibility window для Control Plane API key
 
 До cutover существующий ключ `cp_<prefix>_<secret>` остаётся рабочим
@@ -412,6 +439,12 @@ Credential и federation API:
 - `POST /api/v1/tenants/{tenantId}/channel-links/{linkId}:revoke`;
 - `POST /api/v1/tenants/{tenantId}/channel-links:confirm`;
 - `POST /api/v1/tenants/{tenantId}/channel-assertions:exchange`.
+
+Агенты владельца (token IAM service account со scope `iam:agents`):
+
+- `POST /api/v1/tenants/{tenantId}/agents`;
+- `POST /api/v1/tenants/{tenantId}/agents/{agentId}/platform-access-tokens`;
+- `POST /api/v1/tenants/{tenantId}/agents/{agentId}/platform-access-tokens/{credentialId}:revoke`.
 
 `platform-access-tokens:exchange` не принимает `tenantId` и `principalId` от
 клиента: они берутся из записи предъявленного токена. Выданный access token не

@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     channel_confirm_failure_window_seconds: int = 600
     channel_assertion_limit: int = 10
     channel_assertion_window_seconds: int = 60
+    # Агенты, которыми владеет service account (scope `iam:agents`): audience
+    # самого IAM, scope владельца и срок PAT агента — короче человеческого,
+    # потому что выпускающий его контроллер перевыпускает credential сам.
+    agents_audience: str = "iam"
+    agents_scope: str = "iam:agents"
+    agent_pat_max_ttl_seconds: int = 604800
 
     def resolved_signing_private_key(self) -> str:
         if self.signing_private_key:

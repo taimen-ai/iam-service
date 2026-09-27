@@ -34,6 +34,7 @@ class PrincipalView(BaseModel):
     kind: str
     display_name: str
     status: str
+    owner_principal_id: uuid.UUID | None = None
     created_at: datetime
 
 
