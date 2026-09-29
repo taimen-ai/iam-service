@@ -11,15 +11,15 @@ reference client for local harnesses.
 
 ## Before you start
 
-- Read the [Product Vision](https://github.com/monthu56/taimen/blob/main/docs/product-vision.md)
-  and the [ADR registry](https://github.com/monthu56/taimen/blob/main/docs/adr/README.md).
+- Read the [Product Vision](https://github.com/taimen-ai/taimen/blob/main/docs/product-vision.md)
+  and the [ADR registry](https://github.com/taimen-ai/taimen/blob/main/docs/adr/README.md).
   Architecture decisions are recorded as ADRs (in Russian, with an English
   title line); English summaries are provided on request in the ADR's
   discussion. This component has no ADR series of its own: its boundaries
   are set by the umbrella ADRs (ADR-0013 separates IAM from entitlement and
   domain authorization), so a change to the identity model, the token
   contract or the service boundary starts with an umbrella ADR.
-- Check the [roadmap](https://github.com/monthu56/taimen/blob/main/docs/roadmap.md)
+- Check the [roadmap](https://github.com/taimen-ai/taimen/blob/main/docs/roadmap.md)
   and open issues before starting a large change. For anything that changes
   an API, a data model or a service boundary, open an issue first and
   propose an ADR.
@@ -31,8 +31,8 @@ contribution, so that the project can be relicensed or defended without
 tracking down every author. The CLA is checked by cla-assistant on each pull
 request; you sign once.
 
-- Individuals: [`cla/CLA-individual.md`](https://github.com/monthu56/taimen/blob/main/cla/CLA-individual.md)
-- Companies contributing on behalf of employees: [`cla/CLA-entity.md`](https://github.com/monthu56/taimen/blob/main/cla/CLA-entity.md)
+- Individuals: [`cla/CLA-individual.md`](https://github.com/taimen-ai/taimen/blob/main/cla/CLA-individual.md)
+- Companies contributing on behalf of employees: [`cla/CLA-entity.md`](https://github.com/taimen-ai/taimen/blob/main/cla/CLA-entity.md)
 
 The CLA grants the project a copyright and patent licence to your
 contribution; you keep your copyright.
