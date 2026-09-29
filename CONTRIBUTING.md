@@ -11,16 +11,16 @@ reference client for local harnesses.
 
 ## Before you start
 
-- Read the [Product Vision](https://github.com/taimen-ai/taimen/blob/main/docs/product-vision.md)
-  and the [ADR registry](https://github.com/taimen-ai/taimen/blob/main/docs/adr/README.md).
+- Read the platform overview in the
+  [guide](https://github.com/taimen-ai/taimen/tree/main/guide/docs/overview)
+  (in Russian).
   Architecture decisions are recorded as ADRs (in Russian, with an English
   title line); English summaries are provided on request in the ADR's
   discussion. This component has no ADR series of its own: its boundaries
   are set by the umbrella ADRs (ADR-0013 separates IAM from entitlement and
   domain authorization), so a change to the identity model, the token
   contract or the service boundary starts with an umbrella ADR.
-- Check the [roadmap](https://github.com/taimen-ai/taimen/blob/main/docs/roadmap.md)
-  and open issues before starting a large change. For anything that changes
+- Check the open issues before starting a large change. For anything that changes
   an API, a data model or a service boundary, open an issue first and
   propose an ADR.
 
