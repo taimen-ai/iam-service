@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+from credential_leaks import assert_no_credential_leak
 from iam_service.app import create_app
 from iam_service.config import Settings
 from iam_service.pat.models import AuthenticationContext, PlatformAccessToken
@@ -199,8 +200,7 @@ def test_full_token_is_never_stored_and_never_shown_twice(harness: Harness) -> N
     assert replay.json()["credential"]["id"] == first.json()["credential"]["id"]
 
     dump = harness.dump()
-    assert token not in dump
-    assert token.rsplit("_", 1)[1] not in dump
+    assert_no_credential_leak(token, dump)
     assert hashlib.sha256(token.encode()).hexdigest() in dump
     with harness.session() as session:
         assert len(list(session.scalars(select(PlatformAccessToken)))) == 1
@@ -290,7 +290,8 @@ def test_token_is_bound_to_one_audience_and_ceiling_only_narrows(harness: Harnes
 
     claims = harness.claims(default_scopes.json()["accessToken"], "control-plane")
     assert claims["scope"] == ["read"]
-    assert claims["scope_ceiling"] == ["read", "write"]
+    # Потолок в token — потолок PAT, суженный allowlist audience (ADR-0003).
+    assert claims["scope_ceiling"] == ["read"]
     assert claims["principal_type"] == "human"
     assert claims["acr"] == "urn:mace:incommon:iap:silver"
     assert claims["session_id"] == default_scopes.json()["sessionId"]

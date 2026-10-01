@@ -51,7 +51,14 @@ from iam_service.models import (
     TenantMembership,
 )
 from iam_service.pat import create_platform_token_router, record_authentication_context
-from iam_service.pat.models import AuthenticationContext
+from iam_service.pat.models import AuthenticationContext, PlatformAccessToken
+from iam_service.people import (
+    Caller,
+    create_people_guard,
+    refuse,
+    require_human_target,
+)
+from iam_service.privileged import entitled_privileged_scopes
 from iam_service.schemas import (
     AudienceCreate,
     AudienceUpdate,
@@ -59,6 +66,8 @@ from iam_service.schemas import (
     EventPage,
     EventView,
     ExternalIdentityCreate,
+    ExternalIdentityItem,
+    ExternalIdentityPage,
     ExternalIdentityView,
     FederatedIdentityView,
     FederationAuthenticateRequest,
@@ -72,6 +81,7 @@ from iam_service.schemas import (
     IdentityProviderCreate,
     IdentityProviderView,
     PrincipalCreate,
+    PrincipalPage,
     PrincipalView,
     ServiceAccountCreate,
     ServiceAccountIssued,
@@ -138,6 +148,9 @@ def create_app(
         if not expected or not hmac.compare_digest(x_iam_bootstrap_token, expected):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
         return "bootstrap"
+
+    # Маршруты principals принимают, кроме bootstrap, человека со `iam:people`.
+    people_caller = create_people_guard(settings=runtime_settings, get_session=get_session)
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:
@@ -232,21 +245,215 @@ def create_app(
             raise HTTPException(status_code=404, detail="principal_not_found")
         return principal
 
+    async def replayed_principal(
+        session: AsyncSession, tenant_id: uuid.UUID, actor_ref: str, idempotency_key: str
+    ) -> Principal | None:
+        return await session.scalar(
+            select(Principal)
+            .join(TenantMembership, TenantMembership.principal_id == Principal.id)
+            .where(
+                TenantMembership.tenant_id == tenant_id,
+                TenantMembership.idempotency_actor == actor_ref,
+                TenantMembership.idempotency_key == idempotency_key,
+            )
+        )
+
+    async def people_principal(
+        session: AsyncSession,
+        caller: Caller,
+        *,
+        tenant_id: uuid.UUID,
+        principal_id: uuid.UUID,
+        action: str,
+    ) -> Principal:
+        """`tenant_principal` маршрутов управления людьми: промах пишется в audit.
+
+        Записи audit нужен существующий tenant: bootstrap может спросить и о
+        несуществующем, человеку tenant уже подтвердил guard.
+        """
+
+        try:
+            return await tenant_principal(session, tenant_id, principal_id)
+        except HTTPException:
+            if await session.get(Tenant, tenant_id) is None:
+                raise
+            raise await refuse(
+                session,
+                tenant_id=tenant_id,
+                action=action,
+                actor_ref=caller.actor_ref,
+                resource_id=principal_id,
+                status_code=404,
+                detail="principal_not_found",
+            ) from None
+
+    async def require_onboarding_link(
+        session: AsyncSession,
+        caller: Caller,
+        *,
+        tenant_id: uuid.UUID,
+        principal: Principal,
+        issuer: str,
+    ) -> None:
+        """Человек со `iam:people` привязывает identity только при онбординге.
+
+        Иначе он привязал бы к чужому Principal пару (issuer, subject), которую
+        контролирует сам, и federation-вход усыновил бы её — захват аккаунта.
+        Поэтому по Bearer: цель — не сам вызывающий, issuer — активный
+        провайдер tenant'а, а у цели ещё нет способа входа — ни одной external
+        identity (и отключённой тоже), ни действующего PAT или client secret — и
+        она не член группы администраторов людей. Всё прочее — только
+        bootstrap.
+        """
+
+        target_id = principal.id
+
+        async def deny(status_code: int, detail: str, reason: str = "") -> HTTPException:
+            return await refuse(
+                session,
+                tenant_id=tenant_id,
+                action="external_identities.link",
+                actor_ref=caller.actor_ref,
+                resource_id=target_id,
+                status_code=status_code,
+                detail=detail,
+                reason=reason,
+            )
+
+        if target_id == caller.principal_id:
+            raise await deny(403, "self_link_forbidden")
+        # Блокировка цели до проверок: две параллельные привязки к одному
+        # новичку иначе обе увидели бы «identity нет».
+        await session.scalar(
+            select(Principal.id).where(Principal.id == target_id).with_for_update()
+        )
+        provider = await session.scalar(
+            select(IdentityProvider.id).where(
+                IdentityProvider.tenant_id == tenant_id,
+                IdentityProvider.issuer == issuer,
+                IdentityProvider.status == "active",
+            )
+        )
+        if provider is None:
+            raise await deny(422, "identity_provider_unknown", f"issuer:{issuer}")
+        existing = await session.scalar(
+            select(ExternalIdentity.id).where(ExternalIdentity.principal_id == target_id).limit(1)
+        )
+        if existing is not None:
+            raise await deny(409, "principal_has_identity", f"identity:{existing}")
+        now = datetime.now(UTC)
+        for credential in await session.scalars(
+            select(PlatformAccessToken).where(
+                PlatformAccessToken.principal_id == target_id,
+                PlatformAccessToken.revoked_at.is_(None),
+            )
+        ):
+            expires_at = credential.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at > now:
+                raise await deny(409, "principal_has_credential", f"pat:{credential.id}")
+        # Недостижимо: require_human_target раньше отсекает не-людей, а service
+        # account есть только у Principal своего вида. Защита оставлена
+        # намеренно — на случай, если порядок проверок изменится.
+        account = await session.scalar(
+            select(ServiceAccount.id)
+            .where(ServiceAccount.principal_id == target_id, ServiceAccount.revoked_at.is_(None))
+            .limit(1)
+        )
+        if account is not None:
+            raise await deny(409, "principal_has_credential", f"service_account:{account}")
+        # Членство любого статуса в группе привилегированного scope (ADR-0003):
+        # identity, привязанная к такому человеку, дала бы вызывающему второй
+        # вход администратора людей или fleet.
+        admin_group = await session.scalar(
+            select(Group.key)
+            .join(GroupMember, GroupMember.group_id == Group.id)
+            .where(
+                Group.tenant_id == tenant_id,
+                Group.key.in_(sorted(runtime_settings.privileged_group_keys())),
+                GroupMember.principal_id == target_id,
+            )
+            .order_by(Group.key)
+            .limit(1)
+        )
+        if admin_group is not None:
+            raise await deny(403, "people_admin_protected", f"group:{admin_group}")
+
+    def people_reason(caller: Caller) -> str:
+        if caller.bootstrap:
+            return ""
+        return f"scope:{runtime_settings.people_scope} identity:{caller.external_identity_id}"
+
     @app.post(
         "/api/v1/tenants/{tenant_id}/principals", response_model=PrincipalView, status_code=201
     )
     async def create_principal(
         tenant_id: uuid.UUID,
         body: PrincipalCreate,
-        actor: str = Depends(require_bootstrap),
+        response: Response,
+        idempotency_key: str = Header(default="", alias="Idempotency-Key", max_length=200),
+        caller: Caller = Depends(people_caller),
         session: AsyncSession = Depends(get_session),
     ) -> Principal:
+        """Завести Principal в tenant.
+
+        Bootstrap заводит любой вид, человек со `iam:people` — только `human` и
+        только с `Idempotency-Key`: повтор после неоднозначного ответа вернёт
+        того же Principal, а не заведёт второго.
+        """
+
         if await session.get(Tenant, tenant_id) is None:
             raise HTTPException(status_code=404, detail="tenant_not_found")
+        if not caller.bootstrap:
+            if body.kind != "human":
+                raise await refuse(
+                    session,
+                    tenant_id=tenant_id,
+                    action="principals.create",
+                    actor_ref=caller.actor_ref,
+                    resource_id=caller.principal_id,
+                    status_code=422,
+                    detail="human_principal_required",
+                    reason=f"human_principal_required kind:{body.kind}",
+                )
+            if not idempotency_key:
+                raise HTTPException(status_code=400, detail="idempotency_key_required")
+
+        async def replay() -> Principal | None:
+            # Ключ ищется только среди созданий того же вызывающего.
+            existing = await replayed_principal(
+                session, tenant_id, caller.actor_ref, idempotency_key
+            )
+            if existing is None:
+                return None
+            if existing.kind != body.kind or existing.display_name != body.display_name:
+                raise await refuse(
+                    session,
+                    tenant_id=tenant_id,
+                    action="principals.create",
+                    actor_ref=caller.actor_ref,
+                    resource_id=existing.id,
+                    status_code=409,
+                    detail="idempotency_key_reused",
+                )
+            response.headers["Idempotency-Replayed"] = "true"
+            return existing
+
+        if idempotency_key and (existing := await replay()) is not None:
+            return existing
+
         principal = Principal(kind=body.kind, display_name=body.display_name)
         session.add(principal)
         await session.flush()
-        session.add(TenantMembership(tenant_id=tenant_id, principal_id=principal.id))
+        session.add(
+            TenantMembership(
+                tenant_id=tenant_id,
+                principal_id=principal.id,
+                idempotency_key=idempotency_key or None,
+                idempotency_actor=caller.actor_ref if idempotency_key else None,
+            )
+        )
         session.add(
             OutboxEvent(
                 tenant_id=tenant_id,
@@ -260,14 +467,55 @@ def create_app(
             AuditEvent(
                 tenant_id=tenant_id,
                 action="principals.create",
-                actor_ref=actor,
+                actor_ref=caller.actor_ref,
                 resource_type="principal",
                 resource_id=principal.id,
                 outcome="allowed",
+                reason=people_reason(caller),
             )
         )
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            # Параллельный запрос с тем же ключом успел первым.
+            await session.rollback()
+            concurrent = await replay() if idempotency_key else None
+            if concurrent is None:
+                raise HTTPException(status_code=409, detail="principal_conflict") from exc
+            return concurrent
         return principal
+
+    @app.get("/api/v1/tenants/{tenant_id}/principals", response_model=PrincipalPage)
+    async def list_principals(
+        tenant_id: uuid.UUID,
+        kind: str | None = Query(default=None, pattern=r"^(human|agent|service_account|workload)$"),
+        after: uuid.UUID | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+        _: Caller = Depends(people_caller),
+        session: AsyncSession = Depends(get_session),
+    ) -> PrincipalPage:
+        """Principals tenant'а постранично, по возрастанию id (курсор `after`)."""
+
+        if await session.get(Tenant, tenant_id) is None:
+            raise HTTPException(status_code=404, detail="tenant_not_found")
+        query = (
+            select(Principal)
+            .join(TenantMembership, TenantMembership.principal_id == Principal.id)
+            .where(
+                TenantMembership.tenant_id == tenant_id,
+                TenantMembership.status == "active",
+            )
+        )
+        if kind is not None:
+            query = query.where(Principal.kind == kind)
+        if after is not None:
+            query = query.where(Principal.id > after)
+        rows = list(await session.scalars(query.order_by(Principal.id).limit(limit + 1)))
+        items = rows[:limit]
+        return PrincipalPage(
+            items=[PrincipalView.model_validate(item) for item in items],
+            next_after=items[-1].id if len(rows) > limit else None,
+        )
 
     @app.get(
         "/api/v1/tenants/{tenant_id}/principals/{principal_id}",
@@ -276,10 +524,69 @@ def create_app(
     async def get_principal(
         tenant_id: uuid.UUID,
         principal_id: uuid.UUID,
-        _: str = Depends(require_bootstrap),
+        _: Caller = Depends(people_caller),
         session: AsyncSession = Depends(get_session),
     ) -> Principal:
         return await tenant_principal(session, tenant_id, principal_id)
+
+    def identity_page(identities: list[ExternalIdentity]) -> ExternalIdentityPage:
+        return ExternalIdentityPage(
+            items=[ExternalIdentityItem.model_validate(item) for item in identities]
+        )
+
+    @app.get(
+        "/api/v1/tenants/{tenant_id}/external-identities",
+        response_model=ExternalIdentityPage,
+    )
+    async def find_external_identity(
+        tenant_id: uuid.UUID,
+        issuer: str = Query(min_length=1, max_length=500),
+        subject: str = Query(min_length=1, max_length=500),
+        _: Caller = Depends(people_caller),
+        session: AsyncSession = Depends(get_session),
+    ) -> ExternalIdentityPage:
+        """External identity по точной паре `(issuer, subject)`: 0 или 1.
+
+        Пара уникальна глобально, но видна только identity Principal с
+        активным membership этого tenant'а: чужой tenant — пустой ответ, а не
+        404, чтобы не отличать «нет такой» от «есть, но не у вас». Статус
+        отдаётся как есть — отключённая identity тоже занимает пару.
+        """
+
+        if await session.get(Tenant, tenant_id) is None:
+            raise HTTPException(status_code=404, detail="tenant_not_found")
+        identities = await session.scalars(
+            select(ExternalIdentity)
+            .join(TenantMembership, TenantMembership.principal_id == ExternalIdentity.principal_id)
+            .where(
+                TenantMembership.tenant_id == tenant_id,
+                TenantMembership.status == "active",
+                ExternalIdentity.issuer == issuer,
+                ExternalIdentity.subject == subject,
+            )
+            .limit(1)
+        )
+        return identity_page(list(identities))
+
+    @app.get(
+        "/api/v1/tenants/{tenant_id}/principals/{principal_id}/external-identities",
+        response_model=ExternalIdentityPage,
+    )
+    async def list_principal_external_identities(
+        tenant_id: uuid.UUID,
+        principal_id: uuid.UUID,
+        _: Caller = Depends(people_caller),
+        session: AsyncSession = Depends(get_session),
+    ) -> ExternalIdentityPage:
+        """External identities Principal tenant'а любого статуса, по времени привязки."""
+
+        principal = await tenant_principal(session, tenant_id, principal_id)
+        identities = await session.scalars(
+            select(ExternalIdentity)
+            .where(ExternalIdentity.principal_id == principal.id)
+            .order_by(ExternalIdentity.created_at, ExternalIdentity.id)
+        )
+        return identity_page(list(identities))
 
     @app.post(
         "/api/v1/tenants/{tenant_id}/principals/{principal_id}/external-identities",
@@ -290,10 +597,20 @@ def create_app(
         tenant_id: uuid.UUID,
         principal_id: uuid.UUID,
         body: ExternalIdentityCreate,
-        actor: str = Depends(require_bootstrap),
+        caller: Caller = Depends(people_caller),
         session: AsyncSession = Depends(get_session),
     ) -> ExternalIdentity:
-        principal = await tenant_principal(session, tenant_id, principal_id)
+        action = "external_identities.link"
+        principal = await people_principal(
+            session, caller, tenant_id=tenant_id, principal_id=principal_id, action=action
+        )
+        await require_human_target(
+            session, caller, tenant_id=tenant_id, principal=principal, action=action
+        )
+        if not caller.bootstrap:
+            await require_onboarding_link(
+                session, caller, tenant_id=tenant_id, principal=principal, issuer=body.issuer
+            )
         managed_by = await session.scalar(
             select(IdentityProvider).where(
                 IdentityProvider.tenant_id == tenant_id,
@@ -328,10 +645,11 @@ def create_app(
                 AuditEvent(
                     tenant_id=tenant_id,
                     action="external_identities.link",
-                    actor_ref=actor,
+                    actor_ref=caller.actor_ref,
                     resource_type="external_identity",
                     resource_id=identity.id,
                     outcome="allowed",
+                    reason=people_reason(caller),
                 )
             )
             await session.commit()
@@ -465,6 +783,7 @@ def create_app(
                 provider=provider,
                 principal_id=linked.principal.id,
                 group_keys=project_groups(upstream.groups, mappings=provider.group_mappings),
+                reserved_keys=runtime_settings.privileged_group_keys(),
             )
         except (FederationError, IntegrityError) as exc:
             await session.rollback()
@@ -572,7 +891,7 @@ def create_app(
         principal, identity = outcome.linked.principal, outcome.linked.identity
         provider_key = outcome.provider.key
 
-        async def deny(status_code: int, detail: str) -> HTTPException:
+        async def deny(status_code: int, detail: str, reason: str = "") -> HTTPException:
             # Вход состоялся и остаётся в базе: отказ относится к выпуску
             # credential, а не к identity, и audit должен показывать оба факта.
             session.add(
@@ -583,7 +902,8 @@ def create_app(
                     resource_type="external_identity",
                     resource_id=identity.id,
                     outcome="denied",
-                    reason=f"provider:{provider_key} audience:{body.audience} {detail}",
+                    reason=f"provider:{provider_key} audience:{body.audience} {detail}"
+                    + (f" {reason}" if reason else ""),
                 )
             )
             await session.commit()
@@ -607,8 +927,31 @@ def create_app(
         requested = set(body.scopes)
         if not requested.issubset(allowed):
             raise await deny(403, "scope_not_allowed")
-        # Пустой запрос означает «всё, что разрешено audience».
-        effective = sorted(requested or allowed)
+        # Привилегированные scope (`iam:people`, `fleet:admin`, ADR-0003) —
+        # ограничение конкретного человека поверх audience: только член
+        # группы из реестра (проекция групп выше уже привела членства к token
+        # IdP) и только по явному запросу.
+        privileged = runtime_settings.privileged_scope_groups()
+        entitled = await entitled_privileged_scopes(
+            session,
+            tenant_id=tenant_id,
+            principal_id=principal.id,
+            scopes=allowed,
+            privileged=privileged,
+        )
+        withheld = {scope for scope in allowed if scope in privileged} - entitled
+        refused = sorted(requested & withheld)
+        if refused:
+            raise await deny(
+                403,
+                "scope_not_allowed",
+                " ".join(f"group:{privileged[scope]}" for scope in refused),
+            )
+        ceiling = allowed - withheld
+        # Пустой запрос означает «всё, что разрешено audience», кроме
+        # привилегированных scope: их выдаёт только явный запрос.
+        effective = sorted(requested or allowed - privileged.keys())
+        granted = [scope for scope in effective if scope in privileged]
 
         session_id = uuid.uuid4()
         token = token_issuer().issue(
@@ -621,7 +964,7 @@ def create_app(
             # стабильный ключ для своего revocation-кэша.
             credential_id=identity.id,
             principal_type=principal.kind,
-            scope_ceiling=sorted(allowed),
+            scope_ceiling=sorted(ceiling),
             session_id=session_id,
             # Тот же формат, что в снимке PAT: ISO 8601, серверная подрезка
             # будущего `auth_time` уже применена в record_authentication_context.
@@ -637,6 +980,7 @@ def create_app(
                 resource_id=identity.id,
                 outcome="allowed",
                 reason=f"provider:{provider_key} audience:{body.audience} session:{session_id}"
+                + "".join(f" privileged:{scope}@group:{privileged[scope]}" for scope in granted)
                 + (" jwks:stale" if outcome.resolved.stale else ""),
             )
         )
@@ -938,6 +1282,10 @@ def create_app(
             audience.allowed_scopes
         ):
             raise HTTPException(status_code=403, detail="scope_not_allowed")
+        # `iam:people` — scope человека из federation-входа; service account
+        # его не получает, даже если bootstrap вписал его в потолок.
+        if runtime_settings.people_scope in requested_scopes:
+            raise HTTPException(status_code=403, detail="scope_not_allowed")
         token = token_issuer().issue(
             subject=account.principal_id,
             tenant_id=account.tenant_id,
@@ -1011,6 +1359,7 @@ def create_app(
             settings=runtime_settings,
             get_session=get_session,
             require_bootstrap=require_bootstrap,
+            people_caller=people_caller,
         )
     )
     # SCIM 2.0 provisioning — тоже отдельный пакет со своим форматом ошибок.

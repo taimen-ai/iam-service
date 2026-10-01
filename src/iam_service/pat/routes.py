@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,8 +20,11 @@ from iam_service.config import Settings
 from iam_service.models import (
     Audience,
     AuditEvent,
+    Group,
+    GroupMember,
     OutboxEvent,
     Principal,
+    PrincipalEnablement,
     Tenant,
     TenantMembership,
 )
@@ -49,7 +52,10 @@ from iam_service.pat.schemas import (
     PlatformTokenIntrospectRequest,
     PlatformTokenSelfRevokeRequest,
     PrincipalDisabled,
+    PrincipalEnabled,
 )
+from iam_service.people import Caller, is_people_admin, refuse, require_human_target
+from iam_service.privileged import member_groups
 from iam_service.tokens import TokenIssuer
 
 # Единый ответ на любой дефект предъявленного токена: отозван, истёк, не найден
@@ -65,6 +71,11 @@ _ABSENT_HASH = "0" * 64
 # бы различаться. Service account и workload остаются на client credentials:
 # у них есть свой поток, и размывать им границу PAT нечем.
 _PAT_PRINCIPAL_KINDS = frozenset({"human", "agent"})
+
+# Из каких статусов `:enable` переводит Principal в `active` (ADR-0002, п. 12).
+# Список явный: статус, которого здесь нет, — отказ, а не молчаливое включение.
+# `paused` — чужой lifecycle, у него свой ответ `principal_paused`.
+ENABLE_SOURCE_STATUSES = frozenset({"disabled"})
 
 
 def _now() -> datetime:
@@ -193,11 +204,81 @@ def revoke_credential(
     )
 
 
+async def mark_principal_enabled(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    principal: Principal,
+    source_statuses: frozenset[str] = ENABLE_SOURCE_STATUSES,
+    idempotency_key: str | None = None,
+    idempotency_actor: str | None = None,
+) -> PrincipalEnablement | None:
+    """Перевести Principal в `active` и записать включение (ADR-0002, п. 12).
+
+    Общая часть `:enable` и SCIM-реактивации (`active: true`). Переход — условный
+    `UPDATE … WHERE status = <прочитанный>`: из двух параллельных включений
+    переход совершает одно, и только оно пишет момент включения (guard
+    `iam:people` отсекает по нему token, выпущенные раньше) и событие
+    `principal.enabled`. Проигравший видит `active` и получает no-op.
+
+    Возвращает запись включения; `previous_status = active` означает no-op
+    (запись сохраняется только ради `Idempotency-Key`). `None` — Principal
+    параллельно ушёл в статус, из которого включать нельзя. Коммит остаётся за
+    вызывающим кодом.
+    """
+
+    previous_status = principal.status
+    changed = False
+    if previous_status in source_statuses:
+        result = await session.execute(
+            update(Principal)
+            .where(Principal.id == principal.id, Principal.status == previous_status)
+            .values(status="active")
+            .execution_options(synchronize_session=False)
+        )
+        changed = result.rowcount == 1
+        # Условный UPDATE мимо identity map: объект сессии перечитывается и в
+        # случае перехода, и в случае проигранной гонки.
+        await session.refresh(principal, attribute_names=["status"])
+        if not changed:
+            previous_status = principal.status
+    if not changed and previous_status != "active":
+        return None
+    record = PrincipalEnablement(
+        tenant_id=tenant_id,
+        principal_id=principal.id,
+        previous_status=previous_status,
+        idempotency_key=idempotency_key or None,
+        idempotency_actor=idempotency_actor if idempotency_key else None,
+        enabled_at=_now(),
+    )
+    if changed or idempotency_key:
+        # Без ключа no-op записывать незачем: повторять нечего.
+        session.add(record)
+    if changed:
+        session.add(
+            OutboxEvent(
+                tenant_id=tenant_id,
+                type="principal.enabled",
+                aggregate_type="principal",
+                aggregate_id=principal.id,
+                payload={
+                    "principalId": str(principal.id),
+                    # Resource service не принимает access token этого
+                    # Principal, выпущенные раньше: отключение их закрыло.
+                    "sessionsNotBefore": record.enabled_at.isoformat(),
+                },
+            )
+        )
+    return record
+
+
 def create_platform_token_router(
     *,
     settings: Settings,
     get_session: Callable[..., Any],
     require_bootstrap: Callable[..., Any],
+    people_caller: Callable[..., Any],
 ) -> APIRouter:
     router = APIRouter()
 
@@ -718,14 +799,29 @@ def create_platform_token_router(
         tenant_id: uuid.UUID,
         principal_id: uuid.UUID,
         reason: str = Query(default="principal_disabled", max_length=200),
-        actor: str = Depends(require_bootstrap),
+        caller: Caller = Depends(people_caller),
         session: AsyncSession = Depends(get_session),
     ) -> PrincipalDisabled:
         """Отключение Principal с отзывом всех его credentials.
 
         Тот же путь используется deprovisioning: выпуск новых credentials
         прекращается, а уже выданные PAT перестают обмениваться немедленно.
+        Человек со `iam:people` отключает только людей, но не себя и не
+        других администраторов людей: это остаётся за bootstrap.
         """
+
+        action = "principals.disable"
+
+        async def deny(status_code: int, detail: str) -> HTTPException:
+            return await refuse(
+                session,
+                tenant_id=tenant_id,
+                action=action,
+                actor_ref=caller.actor_ref,
+                resource_id=principal_id,
+                status_code=status_code,
+                detail=detail,
+            )
 
         principal = await session.scalar(
             select(Principal)
@@ -736,14 +832,42 @@ def create_platform_token_router(
             )
         )
         if principal is None:
-            raise HTTPException(status_code=404, detail="principal_not_found")
+            # Записи audit нужен существующий tenant; человеку его уже
+            # подтвердил guard, bootstrap может спросить и о несуществующем.
+            if await session.get(Tenant, tenant_id) is None:
+                raise HTTPException(status_code=404, detail="principal_not_found")
+            raise await deny(404, "principal_not_found")
+        await require_human_target(
+            session, caller, tenant_id=tenant_id, principal=principal, action=action
+        )
+        if not caller.bootstrap:
+            if principal_id == caller.principal_id:
+                raise await deny(409, "self_disable_forbidden")
+            if await is_people_admin(
+                session,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                group_key=settings.people_admin_group,
+            ):
+                raise await deny(403, "people_admin_protected")
         principal.status = "disabled"
         revoked = await revoke_tokens_for_principal(
             session,
             tenant_id=tenant_id,
             principal_id=principal_id,
-            actor=actor,
+            actor=caller.actor_ref,
             reason=reason,
+        )
+        session.add(
+            AuditEvent(
+                tenant_id=tenant_id,
+                action="principals.disable",
+                actor_ref=caller.actor_ref,
+                resource_type="principal",
+                resource_id=principal.id,
+                outcome="allowed",
+                reason=f"{reason} revoked:{revoked}",
+            )
         )
         session.add(
             OutboxEvent(
@@ -758,6 +882,195 @@ def create_platform_token_router(
         return PrincipalDisabled(
             principal_id=principal.id, status=principal.status, revoked_credentials=revoked
         )
+
+    @router.post(
+        "/api/v1/tenants/{tenant_id}/principals/{principal_id}:enable",
+        response_model=PrincipalEnabled,
+        tags=["platform-access-tokens"],
+        responses={
+            400: {"description": "`idempotency_key_required` — Bearer без `Idempotency-Key`"},
+            403: {"description": "`people_admin_protected` — цель в чужой группе привилегий"},
+            404: {"description": "`principal_not_found`"},
+            409: {
+                "description": (
+                    "`self_enable_forbidden`, `idempotency_key_reused`, "
+                    "`principal_paused`, `principal_provisioned`, "
+                    "`principal_status_not_enableable`, `principal_conflict`"
+                )
+            },
+            422: {"description": "`human_principal_required` — по `iam:people` только люди"},
+        },
+    )
+    async def enable_principal(
+        tenant_id: uuid.UUID,
+        principal_id: uuid.UUID,
+        response: Response,
+        idempotency_key: str = Header(default="", alias="Idempotency-Key", max_length=200),
+        caller: Caller = Depends(people_caller),
+        session: AsyncSession = Depends(get_session),
+    ) -> PrincipalEnabled:
+        """Обратная операция к `:disable` (ADR-0002, п. 12).
+
+        Principal снова `active`. Отозванные при отключении credentials (PAT,
+        client secret) не восстанавливаются, а access token, выпущенные до
+        включения, IAM не принимает: человек входит заново через IdP. External
+        identities остаются привязанными. Человек со `iam:people` включает
+        только людей, не себя, и члена группы привилегированного scope — только
+        если сам состоит в той же группе. По Bearer `Idempotency-Key`
+        обязателен: повтор отвечает тем же, не включая заново Principal,
+        которого успели снова отключить.
+        """
+
+        action = "principals.enable"
+
+        async def deny(
+            status_code: int, detail: str, reason: str = "", resource_id: uuid.UUID = principal_id
+        ) -> HTTPException:
+            return await refuse(
+                session,
+                tenant_id=tenant_id,
+                action=action,
+                actor_ref=caller.actor_ref,
+                resource_id=resource_id,
+                status_code=status_code,
+                detail=detail,
+                reason=reason,
+            )
+
+        if not caller.bootstrap and not idempotency_key:
+            raise HTTPException(status_code=400, detail="idempotency_key_required")
+
+        def enabled_view(record: PrincipalEnablement, status: str) -> PrincipalEnabled:
+            return PrincipalEnabled(
+                principal_id=record.principal_id,
+                status=status,
+                previous_status=record.previous_status,
+                enabled_at=_as_aware(record.enabled_at) or record.enabled_at,
+            )
+
+        async def replay() -> PrincipalEnabled | None:
+            # Ключ ищется только среди включений того же вызывающего.
+            record = await session.scalar(
+                select(PrincipalEnablement).where(
+                    PrincipalEnablement.tenant_id == tenant_id,
+                    PrincipalEnablement.idempotency_actor == caller.actor_ref,
+                    PrincipalEnablement.idempotency_key == idempotency_key,
+                )
+            )
+            if record is None:
+                return None
+            if record.principal_id != principal_id:
+                raise await deny(409, "idempotency_key_reused", resource_id=record.principal_id)
+            # Статус — текущий: повтор не включает заново того, кого после
+            # первого включения отключили.
+            current = await session.get(Principal, principal_id)
+            response.headers["Idempotency-Replayed"] = "true"
+            return enabled_view(record, current.status if current else "disabled")
+
+        if idempotency_key and (replayed_view := await replay()) is not None:
+            return replayed_view
+
+        principal = await session.scalar(
+            select(Principal)
+            .join(TenantMembership, TenantMembership.principal_id == Principal.id)
+            .where(
+                TenantMembership.tenant_id == tenant_id,
+                TenantMembership.principal_id == principal_id,
+                TenantMembership.status == "active",
+            )
+        )
+        if principal is None:
+            if await session.get(Tenant, tenant_id) is None:
+                raise HTTPException(status_code=404, detail="principal_not_found")
+            raise await deny(404, "principal_not_found")
+        await require_human_target(
+            session, caller, tenant_id=tenant_id, principal=principal, action=action
+        )
+        if principal.status == "paused":
+            # `paused` — не отключение, а чужой lifecycle: `:enable` его не снимает.
+            raise await deny(409, "principal_paused")
+        if principal.status != "active" and principal.status not in ENABLE_SOURCE_STATUSES:
+            # Исходные статусы перечислены явно: незнакомый — отказ, а не включение.
+            raise await deny(409, "principal_status_not_enableable", f"status:{principal.status}")
+        # Импорт здесь: пакет scim сам импортирует этот модуль (отзыв credentials).
+        from iam_service.scim.models import ScimUser
+
+        provisioned = await session.scalar(
+            select(ScimUser.id).where(
+                ScimUser.tenant_id == tenant_id,
+                ScimUser.principal_id == principal_id,
+                ScimUser.active.is_(False),
+            )
+        )
+        if provisioned is not None:
+            # Человека отключил источник провижининга: включает его он же
+            # (`active: true`), иначе IAM разошёлся бы с кадровой системой.
+            raise await deny(409, "principal_provisioned", f"scim_user:{provisioned}")
+        if not caller.bootstrap:
+            if principal_id == caller.principal_id:
+                raise await deny(409, "self_enable_forbidden")
+            # Включение возвращает цели authority её групп привилегированных
+            # scope (ADR-0003): вернуть её может только член той же группы.
+            target_groups = set(
+                await session.scalars(
+                    select(Group.key)
+                    .join(GroupMember, GroupMember.group_id == Group.id)
+                    .where(
+                        Group.tenant_id == tenant_id,
+                        Group.key.in_(sorted(settings.privileged_group_keys())),
+                        GroupMember.principal_id == principal_id,
+                    )
+                )
+            )
+            caller_groups = await member_groups(
+                session,
+                tenant_id=tenant_id,
+                principal_id=caller.principal_id,
+                group_keys=target_groups,
+            )
+            foreign = sorted(target_groups - caller_groups)
+            if foreign:
+                raise await deny(
+                    403, "people_admin_protected", " ".join(f"group:{key}" for key in foreign)
+                )
+
+        record = await mark_principal_enabled(
+            session,
+            tenant_id=tenant_id,
+            principal=principal,
+            idempotency_key=idempotency_key or None,
+            idempotency_actor=caller.actor_ref,
+        )
+        if record is None:
+            # Параллельно Principal ушёл в статус, из которого не включают.
+            await session.rollback()
+            raise await deny(409, "principal_conflict")
+        via = (
+            ""
+            if caller.bootstrap
+            else f" scope:{settings.people_scope} identity:{caller.external_identity_id}"
+        )
+        session.add(
+            AuditEvent(
+                tenant_id=tenant_id,
+                action=action,
+                actor_ref=caller.actor_ref,
+                resource_type="principal",
+                resource_id=principal.id,
+                outcome="allowed",
+                reason=f"previous:{record.previous_status}{via}",
+            )
+        )
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            # Параллельный запрос с тем же ключом успел первым.
+            await session.rollback()
+            concurrent = await replay() if idempotency_key else None
+            if concurrent is None:
+                raise HTTPException(status_code=409, detail="principal_conflict") from exc
+            return concurrent
+        return enabled_view(record, "active")
 
     @router.post(
         "/api/v1/platform-access-tokens:exchange",
@@ -806,14 +1119,18 @@ def create_platform_token_router(
         if audience is None:
             raise await deny(403, "audience_not_allowed", f"audience:{body.audience}")
 
-        ceiling = set(credential.scope_ceiling)
-        allowed = set(audience.allowed_scopes)
+        # Привилегированные scope (`iam:people`, `fleet:admin`, ADR-0003) выдаёт
+        # только federation-вход члену группы: PAT живёт неделями и authority
+        # администратора не переносит.
+        allowed = set(audience.allowed_scopes) - settings.privileged_scope_groups().keys()
+        # Потолок token — то, что PAT вообще может принести в этот audience:
+        # привилегированный scope не попадает даже в `scope_ceiling`.
+        ceiling = set(credential.scope_ceiling) & allowed
         requested = set(body.scopes)
-        if requested and not requested.issubset(ceiling & allowed):
+        if requested and not requested.issubset(ceiling):
             raise await deny(403, "scope_not_allowed", f"audience:{body.audience}")
-        # Пустой запрос означает «весь потолок», но потолок всё равно
-        # пересекается с тем, что вообще разрешено audience.
-        effective = sorted(requested or (ceiling & allowed))
+        # Пустой запрос означает «весь потолок» (уже суженный audience).
+        effective = sorted(requested or ceiling)
 
         session_id = uuid.uuid4()
         context = credential.authentication_context or {}

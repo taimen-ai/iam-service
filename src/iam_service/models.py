@@ -62,11 +62,47 @@ class Principal(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class PrincipalEnablement(Base):
+    """Запись `:enable` Principal (ADR-0002, п. 12).
+
+    Хранит `Idempotency-Key` включения — он принадлежит вызывающему, как ключ
+    создания в membership, — и момент включения: access token, выпущенные до
+    него, не оживают вместе с Principal.
+    """
+
+    __tablename__ = "principal_enablements"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_actor",
+            "idempotency_key",
+            name="uq_principal_enablements_idempotency",
+        ),
+        Index("ix_principal_enablements_principal", "principal_id", "enabled_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("tenants.id"))
+    principal_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("principals.id"))
+    # Статус до включения. `active` — включение было no-op (ключ записан для
+    # повтора), момент такого включения токены не отсекает.
+    previous_status: Mapped[str] = mapped_column(String(20))
+    idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    idempotency_actor: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    enabled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class TenantMembership(Base):
     __tablename__ = "tenant_memberships"
     __table_args__ = (
         CheckConstraint("status IN ('active', 'disabled')", name="status"),
         Index("ix_tenant_memberships_principal", "principal_id", "tenant_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_actor",
+            "idempotency_key",
+            name="uq_tenant_memberships_idempotency",
+        ),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("tenants.id"), primary_key=True)
@@ -74,6 +110,11 @@ class TenantMembership(Base):
         Uuid, ForeignKey("principals.id"), primary_key=True
     )
     status: Mapped[str] = mapped_column(String(20), default="active")
+    # `Idempotency-Key` создания Principal в этом tenant: повтор запроса
+    # возвращает того же Principal, а не заводит второго. Ключ принадлежит
+    # вызывающему (`actor_ref` audit): чужой ключ не открывает чужой Principal.
+    idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    idempotency_actor: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

@@ -218,6 +218,73 @@ the agent's access token has neither `auth_time` nor `acr`. Revoking the service
 account closes this path immediately rather than when its token expires. The
 decision is [ADR-0001](docs/adr/0001-iam-agents-scope.md).
 
+### Managing people: scope `iam:people`
+
+The runtime console creates, disables and re-enables people **without the bootstrap
+token** — with the IAM token of the signed-in human: audience
+`IAM_PEOPLE_AUDIENCE` (default `iam`), scope `IAM_PEOPLE_SCOPE` (`iam:people`).
+The principal routes (create, list, read, link and read external identities,
+`:disable`, `:enable`) accept it alongside the bootstrap token.
+
+- Only `federation:exchange` grants the scope, and only to a human: the token's
+  `credential_id` must be an active federated identity of that human
+  (`403 federation_required`). PAT exchange and client credentials never issue
+  `iam:people`. Who is an administrator is decided by IAM policy, not by the
+  request: the scope must be in the allowed scopes of the tenant's `iam`
+  audience **and** the human must be a member of the tenant group
+  `IAM_PEOPLE_ADMIN_GROUP` (default `people-admins`; the IdP group is projected
+  through `groupMappings` of the identity provider). The scope is issued only
+  when requested explicitly — an empty scope request never includes it.
+  Leaving the group closes the path immediately (`403 people_admin_required`).
+- Under `iam:people` only `human` principals are created, and only humans can
+  get an identity linked or be disabled (`422 human_principal_required`).
+- Linking an identity is onboarding only: the target is not the caller
+  (`403 self_link_forbidden`), the issuer is an active identity provider of
+  the tenant (`422 identity_provider_unknown`), and the target has no active
+  external identity yet (`409 principal_has_identity`). Everything else is
+  bootstrap-only.
+- `:disable` refuses the caller themselves (`409 self_disable_forbidden`) and
+  members of the admin group (`403 people_admin_protected`); bootstrap can
+  disable anyone.
+- `:enable` is the reverse operation: the principal is `active` again and IdP
+  login works right away (external identities stay linked). PATs and client
+  secrets revoked at disable are not restored. Access tokens issued before
+  enabling are rejected by IAM itself only on the `iam:people` path
+  (`401 invalid_token`, audit `closed:session`); other resource services get
+  `sessionsNotBefore` in the `principal.enabled` event but do not consume it
+  yet, so for them the window is bounded by the access token TTL
+  (`IAM_TOKEN_TTL_SECONDS`). SCIM reactivation (`active: true`) records the
+  enablement the same way. The event is emitted only on an actual transition
+  (a conditional update: of two parallel enables, one wins). Only a
+  `disabled` principal is enabled; any other inactive status is refused rather
+  than silently enabled (`409 principal_status_not_enableable`, `paused` —
+  see below). Under a Bearer token one cannot
+  enable oneself (`409 self_enable_forbidden`) or a member of a
+  privileged-scope group the caller is not in (`403 people_admin_protected`); `Idempotency-Key` is
+  mandatory, a repeat answers the same (`Idempotency-Replayed: true`) and does
+  not re-enable someone disabled again in between. `:enable` leaves `paused`
+  principals and people disabled by SCIM alone (`409 principal_paused` /
+  `principal_provisioned`).
+- Creation requires `Idempotency-Key`, scoped to the caller: a repeat returns
+  the same principal (`Idempotency-Replayed: true`), a different body with the
+  same key — `409 idempotency_key_reused`.
+- The audit `actor_ref` is the calling human's principal id; refusals are
+  audited too (`outcome = denied`, `resource_type = principal`).
+
+The decision is [ADR-0002](docs/adr/0002-iam-people-scope.md).
+
+### Privileged scopes
+
+`federation:exchange` issues `iam:people`, `fleet:admin` and the scopes listed
+in `IAM_PRIVILEGED_SCOPES` (a JSON object scope → group key) only on explicit
+request and only to a member of an active tenant group created by bootstrap
+(`fleet:admin` → `fleet-admins`, `iam:people` → `people-admins`). An empty
+scope request never includes them; an explicit request by a non-member gets
+`403 scope_not_allowed`. Federation and SCIM never create these groups, and PAT
+exchange never issues privileged scopes. For foreign audiences membership is
+fixed at issue time: revocation takes effect when the token expires. The
+decision is [ADR-0003](docs/adr/0003-privileged-scopes.md).
+
 ### Compatibility window for the Control Plane API key
 
 Until the cutover, the existing `cp_<prefix>_<secret>` key remains a working
@@ -389,9 +456,8 @@ only for local development and must be replaced in any shared environment.
 ## Local development
 
 ```bash
-uv sync
-uv run pytest
-uv run ruff check .
+make install
+make check    # ruff, pytest and the single alembic head, as CI runs them
 ```
 
 Migrations against the local PostgreSQL from Compose:
@@ -415,6 +481,7 @@ Bootstrap management API:
 
 - `POST /api/v1/tenants`;
 - `POST /api/v1/tenants/{tenantId}/principals`;
+- `GET /api/v1/tenants/{tenantId}/principals`;
 - `GET /api/v1/tenants/{tenantId}/principals/{principalId}`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities`;
 - `POST /api/v1/tenants/{tenantId}/identity-providers`;
@@ -424,6 +491,7 @@ Bootstrap management API:
 - `POST /api/v1/tenants/{tenantId}/service-accounts`;
 - `POST /api/v1/tenants/{tenantId}/service-accounts/{clientId}:revoke`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}:disable`;
+- `POST /api/v1/tenants/{tenantId}/principals/{principalId}:enable`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}/authentication-contexts`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}/platform-access-tokens`;
 - `GET /api/v1/tenants/{tenantId}/platform-access-tokens`;
@@ -466,6 +534,20 @@ Agents of an owner (IAM token of a service account with scope `iam:agents`):
 - `POST /api/v1/tenants/{tenantId}/agents`;
 - `POST /api/v1/tenants/{tenantId}/agents/{agentId}/platform-access-tokens`;
 - `POST /api/v1/tenants/{tenantId}/agents/{agentId}/platform-access-tokens/{credentialId}:revoke`.
+
+Managing people (bootstrap or an IAM token of a human with scope `iam:people`):
+
+- `POST /api/v1/tenants/{tenantId}/principals` (`human` only,
+  `Idempotency-Key`);
+- `GET /api/v1/tenants/{tenantId}/principals`;
+- `GET /api/v1/tenants/{tenantId}/principals/{principalId}`;
+- `POST /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities`;
+- `GET /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities`;
+- `GET /api/v1/tenants/{tenantId}/external-identities?issuer=&subject=` (exact
+  pair, `{"items": []}` with zero or one item);
+- `POST /api/v1/tenants/{tenantId}/principals/{principalId}:disable`;
+- `POST /api/v1/tenants/{tenantId}/principals/{principalId}:enable`
+  (`Idempotency-Key`).
 
 `platform-access-tokens:exchange` does not accept `tenantId` and `principalId`
 from the client: they are taken from the record of the presented token. An

@@ -29,6 +29,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
+from credential_leaks import assert_no_credential_leak
 from iam_client.cli import EXIT_OK, EXIT_REMOTE, EXIT_UNAUTHENTICATED, EXIT_USAGE, Runtime, main
 from iam_client.store import ENV_PRINCIPAL, CredentialStore, NullKeychain
 from iam_service.app import create_app
@@ -315,8 +316,7 @@ def test_login_keeps_the_secret_out_of_repository_and_output(workstation: Workst
     assert result.code == EXIT_OK, result.output
     # Секрет не появляется ни в выводе, ни в репозитории: наружу выходит
     # только публичный prefix.
-    assert token not in result.output
-    assert token.rsplit("_", 1)[1] not in result.output
+    assert_no_credential_leak(token, result.output)
     assert "iam_pat_" + token.split("_")[2] in result.stdout
     assert token not in workstation.repository_contents()
     assert not (workstation.repository / ".iam" / "credentials.json").exists()
@@ -635,8 +635,7 @@ def test_iam_journal_keeps_no_credential_after_full_flow(workstation: Workstatio
 
     # Журнал событий описывает выпуск, обмен и отзыв, но ни PAT, ни выданный
     # access token в него не попадают.
-    assert token not in events
-    assert token.rsplit("_", 1)[1] not in events
+    assert_no_credential_leak(token, events)
     assert presented not in events
     assert "credential.revoked" in events
 

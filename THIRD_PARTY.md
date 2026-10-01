@@ -45,7 +45,7 @@ The components below are used under the following conditions:
 - pydantic 2.13.4 — MIT
 - pydantic-settings 2.15.0 — MIT
 - pydantic_core 2.46.4 — MIT
-- PyJWT 2.13.0 — MIT
+- PyJWT 2.15.1 — MIT
 - python-dotenv 1.2.2 — BSD-3-Clause
 - PyYAML 6.0.3 — MIT
 - SQLAlchemy 2.0.52 — MIT

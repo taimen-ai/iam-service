@@ -1,6 +1,11 @@
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Привилегированные scope чужих audience, которые реестр содержит всегда:
+# настройка может переназначить им группу, но не снять привилегию (ADR-0003).
+BUILTIN_PRIVILEGED_SCOPES: dict[str, str] = {"fleet:admin": "fleet-admins"}
 
 
 class Settings(BaseSettings):
@@ -51,6 +56,30 @@ class Settings(BaseSettings):
     agents_audience: str = "iam"
     agents_scope: str = "iam:agents"
     agent_pat_max_ttl_seconds: int = 604800
+    # Управление людьми (scope `iam:people`): audience самого IAM и scope,
+    # который federation выдаёт по явному запросу только членам группы
+    # администраторов людей tenant'а (ADR-0002).
+    people_audience: str = "iam"
+    people_scope: str = "iam:people"
+    people_admin_group: str = "people-admins"
+    # Реестр привилегированных scope (ADR-0003): scope → ключ группы tenant'а
+    # (`source = local`, заводит только bootstrap), члену которой federation
+    # выдаёт scope по явному запросу. Дополняет BUILTIN_PRIVILEGED_SCOPES;
+    # `IAM_PEOPLE_SCOPE` → `IAM_PEOPLE_ADMIN_GROUP` входит всегда. В окружении —
+    # JSON-объект `IAM_PRIVILEGED_SCOPES`.
+    privileged_scopes: dict[str, str] = Field(default_factory=dict)
+
+    def privileged_scope_groups(self) -> dict[str, str]:
+        return {
+            **BUILTIN_PRIVILEGED_SCOPES,
+            **self.privileged_scopes,
+            self.people_scope: self.people_admin_group,
+        }
+
+    def privileged_group_keys(self) -> frozenset[str]:
+        """Ключи групп, которые заводит только bootstrap."""
+
+        return frozenset(self.privileged_scope_groups().values())
 
     def resolved_signing_private_key(self) -> str:
         if self.signing_private_key:

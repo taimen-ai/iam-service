@@ -1,0 +1,29 @@
+name: CI
+
+# The suite is self-contained (SQLite, in-process fake OIDC issuer), so every
+# push to main and every pull request runs it in full. Steps call the Makefile
+# targets — the same ones the runner's pre-submit checks call
+# (.agents/runner.yaml) — instead of copying their commands.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: make install
+      - run: make lint
+      - run: make test
+      - run: make migrations-check

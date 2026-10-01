@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from iam_service.app import create_app
 from iam_service.config import Settings
-from iam_service.models import ExternalIdentity, GroupMember, OutboxEvent, Principal
+from iam_service.models import ExternalIdentity, Group, GroupMember, OutboxEvent, Principal
 from iam_service.scim.driver import UpstreamResponse
 from iam_service.scim.models import ProvisioningSource, ScimGroup, ScimUser
 from iam_service.tokens import TokenIssuer
@@ -484,6 +484,26 @@ def test_group_membership_is_idempotent(harness: Harness) -> None:
     assert replayed.json()["meta"]["version"] == added.json()["meta"]["version"]
     assert removed.json()["members"] == []
     assert removed_again.json()["meta"]["version"] == removed.json()["meta"]["version"]
+
+
+def test_scim_cannot_create_the_people_admin_group(harness: Harness) -> None:
+    """Группу администраторов людей заводит только bootstrap (ADR-0002)."""
+
+    refused = harness.create_group(display_name="People Admins")
+
+    assert refused.status_code == 409
+    with harness.session() as session:
+        assert session.scalar(select(Group).where(Group.key == "people-admins")) is None
+
+
+def test_scim_cannot_create_the_fleet_admin_group(harness: Harness) -> None:
+    """Группы всех привилегированных scope заводит только bootstrap (ADR-0003)."""
+
+    refused = harness.create_group(display_name="Fleet Admins")
+
+    assert refused.status_code == 409
+    with harness.session() as session:
+        assert session.scalar(select(Group).where(Group.key == "fleet-admins")) is None
 
 
 def test_one_population_has_a_single_authoritative_source(harness: Harness, idp) -> None:

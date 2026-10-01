@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -155,11 +155,15 @@ async def reconcile_group_projection(
     provider: IdentityProvider,
     principal_id: uuid.UUID,
     group_keys: Sequence[str],
+    reserved_keys: Collection[str] = (),
 ) -> list[str]:
     """Приводит federated членства провайдера к текущему состоянию токена.
 
     Локальные членства и членства других провайдеров не трогаются: удаление
     upstream-группы отзывает только то, что породила эта federation.
+    Группы с ключами `reserved_keys` (привилегированных scope) federation не
+    создаёт: их заводит только bootstrap, а членство в заведённой проецируется
+    как обычно.
     """
 
     desired = sorted(set(group_keys))
@@ -169,6 +173,7 @@ async def reconcile_group_projection(
             select(Group).where(Group.tenant_id == tenant_id, Group.key.in_(desired))
         )
     }
+    desired = [key for key in desired if key in groups or key not in reserved_keys]
     for key in desired:
         if key in groups:
             continue

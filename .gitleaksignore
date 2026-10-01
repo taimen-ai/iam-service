@@ -1,0 +1,2 @@
+# Синтетический токен формата в тесте утечек (коммит 91dcbbf, до TASK-001221): не секрет.
+91dcbbff92914aaf2faf1c79f63d3b75effb8ec9:tests/test_credential_leaks.py:generic-api-key:42

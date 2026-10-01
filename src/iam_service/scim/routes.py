@@ -123,6 +123,7 @@ def create_scim_router(
             source=source,
             provider=provider,
             driver=build_driver(source, upstream_transport),
+            reserved_group_keys=settings.privileged_group_keys(),
         )
 
     def page(start_index: int, count: int) -> tuple[int, int]:

@@ -38,6 +38,11 @@ class PrincipalView(BaseModel):
     created_at: datetime
 
 
+class PrincipalPage(BaseModel):
+    items: list[PrincipalView]
+    next_after: uuid.UUID | None
+
+
 class ExternalIdentityCreate(BaseModel):
     issuer: str = Field(min_length=1, max_length=500)
     subject: str = Field(min_length=1, max_length=500)
@@ -52,6 +57,27 @@ class ExternalIdentityView(BaseModel):
     subject: str
     status: str
     created_at: datetime
+
+
+class ExternalIdentityItem(BaseModel):
+    """External identity в чтении по `iam:people` (TASK-000908).
+
+    Только пара `(issuer, subject)`, владелец и статус: служебные поля
+    (provider, provisioning source, последний вход) чтению консоли не нужны.
+    Поля в snake_case, как у остальных ответов маршрутов людей.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    principal_id: uuid.UUID
+    issuer: str
+    subject: str
+    status: str
+
+
+class ExternalIdentityPage(BaseModel):
+    items: list[ExternalIdentityItem]
 
 
 class IdentityProviderCreate(BaseModel):

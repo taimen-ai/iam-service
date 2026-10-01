@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import Any
 
@@ -27,7 +28,7 @@ from iam_service.models import (
     Principal,
     TenantMembership,
 )
-from iam_service.pat.routes import revoke_tokens_for_principal
+from iam_service.pat.routes import mark_principal_enabled, revoke_tokens_for_principal
 from iam_service.scim.driver import UpstreamUnavailable
 from iam_service.scim.errors import ScimFault
 from iam_service.scim.filters import FilterTerm
@@ -75,11 +76,16 @@ class ProvisioningService:
         source: ProvisioningSource,
         provider: IdentityProvider,
         driver: Any,
+        reserved_group_keys: Collection[str] = (),
     ) -> None:
         self.session = session
         self.source = source
         self.provider = provider
         self.driver = driver
+        # Ключи групп, которые заводит только bootstrap (группы привилегированных
+        # scope, ADR-0003): группа источника с таким ключом раздавала бы права
+        # администратора.
+        self.reserved_group_keys = frozenset(reserved_group_keys)
         self.actor = f"provisioning_source:{source.key}"
 
     # --- служебное -----------------------------------------------------
@@ -378,7 +384,20 @@ class ProvisioningService:
             else None
         )
         if principal is not None:
-            principal.status = "active" if active else "disabled"
+            if active:
+                # Реактивация источником — то же включение, что `:enable`:
+                # запись включения отсекает access token, выпущенные до неё,
+                # на пути `iam:people`, событие несёт `sessionsNotBefore`.
+                # Кадровая система — хозяин lifecycle, поэтому SCIM включает
+                # из любого неактивного статуса.
+                await mark_principal_enabled(
+                    self.session,
+                    tenant_id=self.source.tenant_id,
+                    principal=principal,
+                    source_statuses=frozenset({"disabled", "paused"}),
+                )
+            else:
+                principal.status = "disabled"
         if identity is not None:
             identity.status = "active" if active else "disabled"
         if not active:
@@ -484,10 +503,13 @@ class ProvisioningService:
             display_name=body.display_name,
             group_id=uuid.uuid4(),
         )
+        key = group_key(body.display_name, fallback=scim_group.group_id)
+        if key in self.reserved_group_keys:
+            raise ScimFault(409, "group key is reserved", scim_type="uniqueness")
         group = Group(
             id=scim_group.group_id,
             tenant_id=self.source.tenant_id,
-            key=group_key(body.display_name, fallback=scim_group.group_id),
+            key=key,
             name=body.display_name,
             source=SOURCE_PROVISIONED,
             provisioning_source_id=self.source.id,

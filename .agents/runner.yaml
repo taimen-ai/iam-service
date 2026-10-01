@@ -1,0 +1,12 @@
+# Машиночитаемые соглашения репозитория для исполнителя; проза — AGENTS.md.
+# Формат — runner.yaml v1 (control-plane: src/control_plane_agent/runner_config.md).
+# Демон читает файл только с базовой ревизии задачи.
+version: 1
+# Только для чтения: контракт токена (platform-auth-sdk) и потребитель IAM (control-plane).
+neighbours: [platform-auth-sdk, control-plane]
+setup: uv sync --frozen
+# Тесты на SQLite: тестовые сервисы не нужны.
+checks:
+  - {name: lint, run: make lint}
+  - {name: tests, run: make test}
+  - {name: migrations, run: make migrations-check}

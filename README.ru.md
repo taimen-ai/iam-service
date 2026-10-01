@@ -204,6 +204,70 @@ confidential service account, audience `IAM_AGENTS_AUDIENCE` (по умолча�
 account закрывает этот путь сразу, не дожидаясь истечения его token. Решение —
 [ADR-0001](docs/adr/0001-iam-agents-scope.md).
 
+### Управление людьми: scope `iam:people`
+
+Консоль runtime заводит, отключает и включает людей **без bootstrap-токена** — по token
+IAM вошедшего человека: audience `IAM_PEOPLE_AUDIENCE` (по умолчанию `iam`),
+scope `IAM_PEOPLE_SCOPE` (`iam:people`). Маршруты principals (создание, список,
+чтение, привязка и чтение external identities, `:disable`, `:enable`) принимают его
+наравне с bootstrap-токеном.
+
+- Scope выдаёт только `federation:exchange` и только человеку: `credential_id`
+  token должен быть активной federated identity самого человека
+  (`403 federation_required`). Обмен PAT и client credentials `iam:people` не
+  выпускают. Кто администратор, решает политика IAM, а не запрос: scope есть в
+  allowed scopes audience `iam` tenant'а **и** человек — член группы tenant'а
+  `IAM_PEOPLE_ADMIN_GROUP` (по умолчанию `people-admins`; группа IdP
+  проецируется через `groupMappings` провайдера). Scope выдаётся только по
+  явному запросу — пустой запрос его не включает. Выход из группы закрывает
+  путь сразу (`403 people_admin_required`).
+- По `iam:people` заводится только `human`, а привязать identity и отключить
+  можно только человека (`422 human_principal_required`).
+- Привязка identity — только онбординг: цель — не сам вызывающий
+  (`403 self_link_forbidden`), issuer — активный identity provider tenant'а
+  (`422 identity_provider_unknown`), у цели ещё нет активной external identity
+  (`409 principal_has_identity`). Всё прочее — только bootstrap.
+- `:disable` не отключает самого вызывающего (`409 self_disable_forbidden`) и
+  членов группы администраторов (`403 people_admin_protected`); bootstrap
+  отключает кого угодно.
+- `:enable` — обратная операция: Principal снова `active`, вход через IdP
+  открывается сразу (external identities остаются привязанными). Отозванные
+  при отключении PAT и client secret не восстанавливаются. Access token,
+  выпущенные до включения, сам IAM отвергает только на пути `iam:people`
+  (`401 invalid_token`, в audit `closed:session`); остальные resource service
+  получают `sessionsNotBefore` в событии `principal.enabled`, но пока его не
+  потребляют, и для них окно ограничено TTL access token
+  (`IAM_TOKEN_TTL_SECONDS`). SCIM-реактивация (`active: true`) записывает
+  включение так же. Событие — только при фактическом переходе (условный
+  UPDATE: из двух параллельных включений переходит одно). Включается только
+  `disabled`; прочий неактивный статус — отказ, а не молчаливое включение
+  (`409 principal_status_not_enableable`, про `paused` — ниже). По Bearer
+  нельзя включить себя (`409 self_enable_forbidden`) и члена группы
+  привилегированного scope, в которой вызывающий не состоит
+  (`403 people_admin_protected`);
+  `Idempotency-Key` обязателен, повтор отвечает тем же
+  (`Idempotency-Replayed: true`) и не включает заново того, кого успели снова
+  отключить. `paused` и человека, отключённого SCIM, `:enable` не трогает
+  (`409 principal_paused` / `principal_provisioned`).
+- Создание требует `Idempotency-Key`, ключ принадлежит вызывающему: повтор
+  возвращает того же Principal (`Idempotency-Replayed: true`), другое тело с
+  тем же ключом — `409 idempotency_key_reused`.
+- `actor_ref` в audit — id вызывающего человека; отказы тоже пишутся в audit
+  (`outcome = denied`, `resource_type = principal`).
+
+Решение — [ADR-0002](docs/adr/0002-iam-people-scope.md).
+
+### Привилегированные scope
+
+`iam:people`, `fleet:admin` и scope из `IAM_PRIVILEGED_SCOPES` (JSON-объект
+scope → ключ группы) `federation:exchange` выдаёт только по явному запросу и
+только члену активной группы tenant'а, заведённой bootstrap (`fleet:admin` →
+`fleet-admins`, `iam:people` → `people-admins`). Пустой запрос scope их не
+включает; явный запрос не-члена — `403 scope_not_allowed`. Federation и SCIM
+такие группы не создают, PAT привилегированных scope не выдаёт. Для чужих
+audience членство фиксируется при выдаче: отзыв действует по истечении TTL
+token. Решение — [ADR-0003](docs/adr/0003-privileged-scopes.md).
+
 ### Compatibility window для Control Plane API key
 
 До cutover существующий ключ `cp_<prefix>_<secret>` остаётся рабочим
@@ -368,9 +432,8 @@ API доступен на `http://localhost:8010`, health check — `/healthz`, 
 ## Локальная разработка
 
 ```bash
-uv sync
-uv run pytest
-uv run ruff check .
+make install
+make check    # ruff, pytest и одна голова alembic — как в CI
 ```
 
 Миграции с локальной PostgreSQL из Compose:
@@ -394,6 +457,7 @@ Bootstrap management API:
 
 - `POST /api/v1/tenants`;
 - `POST /api/v1/tenants/{tenantId}/principals`;
+- `GET /api/v1/tenants/{tenantId}/principals`;
 - `GET /api/v1/tenants/{tenantId}/principals/{principalId}`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities`;
 - `POST /api/v1/tenants/{tenantId}/identity-providers`;
@@ -403,6 +467,7 @@ Bootstrap management API:
 - `POST /api/v1/tenants/{tenantId}/service-accounts`;
 - `POST /api/v1/tenants/{tenantId}/service-accounts/{clientId}:revoke`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}:disable`;
+- `POST /api/v1/tenants/{tenantId}/principals/{principalId}:enable`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}/authentication-contexts`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}/platform-access-tokens`;
 - `GET /api/v1/tenants/{tenantId}/platform-access-tokens`;
@@ -445,6 +510,20 @@ Credential и federation API:
 - `POST /api/v1/tenants/{tenantId}/agents`;
 - `POST /api/v1/tenants/{tenantId}/agents/{agentId}/platform-access-tokens`;
 - `POST /api/v1/tenants/{tenantId}/agents/{agentId}/platform-access-tokens/{credentialId}:revoke`.
+
+Управление людьми (bootstrap или token IAM человека со scope `iam:people`):
+
+- `POST /api/v1/tenants/{tenantId}/principals` (только `human`,
+  `Idempotency-Key`);
+- `GET /api/v1/tenants/{tenantId}/principals`;
+- `GET /api/v1/tenants/{tenantId}/principals/{principalId}`;
+- `POST /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities`;
+- `GET /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities`;
+- `GET /api/v1/tenants/{tenantId}/external-identities?issuer=&subject=` (точная
+  пара, `{"items": []}` из нуля или одного элемента);
+- `POST /api/v1/tenants/{tenantId}/principals/{principalId}:disable`;
+- `POST /api/v1/tenants/{tenantId}/principals/{principalId}:enable`
+  (`Idempotency-Key`).
 
 `platform-access-tokens:exchange` не принимает `tenantId` и `principalId` от
 клиента: они берутся из записи предъявленного токена. Выданный access token не

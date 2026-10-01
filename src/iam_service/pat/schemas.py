@@ -184,3 +184,18 @@ class PrincipalDisabled(BaseModel):
     principal_id: uuid.UUID = Field(serialization_alias="principalId")
     status: str
     revoked_credentials: int = Field(serialization_alias="revokedCredentials")
+
+
+class PrincipalEnabled(BaseModel):
+    """Ответ `:enable`: текущий статус и что было до этого включения.
+
+    Отозванные при отключении credentials не восстанавливаются, поэтому
+    счётчика «восстановленных» нет: человек входит заново через IdP.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    principal_id: uuid.UUID = Field(serialization_alias="principalId")
+    status: str
+    previous_status: str = Field(serialization_alias="previousStatus")
+    enabled_at: datetime = Field(serialization_alias="enabledAt")

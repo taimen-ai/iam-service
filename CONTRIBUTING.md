@@ -46,16 +46,19 @@ the umbrella (`git clone --recurse-submodules <umbrella-url>`, then
 `make check-iam-service`).
 
 ```bash
-uv sync                       # runtime dependencies plus the `dev` group (pytest, ruff, aiosqlite)
-uv run pytest                 # unit tests; no services needed
-uv run ruff check .           # lint
-uv run ruff format --check .  # formatting, checked in CI as well
+make install           # uv sync --frozen: runtime dependencies plus the `dev` group
+make lint              # ruff check and ruff format --check
+make test              # unit tests; no services needed
+make migrations-check  # exactly one alembic head
+make check             # all of the above except install, as CI runs it
 ```
 
 The test suite is self-contained: the database is SQLite through `aiosqlite`,
 the migration round-trip test runs against a temporary SQLite file, and
 upstream identity providers are replaced by the in-process fake OIDC issuer
-from `tests/conftest.py`. This is exactly what CI runs.
+from `tests/conftest.py`. CI (`.github/workflows/ci.yml`) calls the same
+targets, and so do the pre-submit checks of the automated executor
+(`.agents/runner.yaml`; its conventions are in `AGENTS.md`).
 
 To run the service itself you need PostgreSQL and an RS256 signing key that
 stays out of Git (`.secrets/` is ignored):
