@@ -164,9 +164,11 @@ class ExternalIdentity(Base):
         ),
         CheckConstraint("status IN ('active', 'disabled')", name="status"),
         CheckConstraint(
-            "source IN ('manual', 'federated', 'provisioned', 'channel')", name="source"
+            "source IN ('manual', 'federated', 'provisioned', 'channel', 'connection')",
+            name="source",
         ),
         Index("ix_external_identities_principal", "principal_id"),
+        Index("ix_external_identities_email", "email"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -187,6 +189,10 @@ class ExternalIdentity(Base):
         DateTime(timezone=True), nullable=True
     )
     last_acr: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Подтверждённая IdP почта последнего federation-входа (ADR-0004, п. 1):
+    # ключ поиска человека, не атрибут для чтения. Не уникальна — один ящик
+    # бывает у двух identity; неподтверждённая почта очищает колонку.
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
 
 
 class Audience(Base):

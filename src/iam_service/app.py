@@ -15,10 +15,12 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from iam_service.access_log import install_access_log_filter
 from iam_service.agents import create_agent_router
 from iam_service.channels import create_channel_router
 from iam_service.config import Settings
 from iam_service.db import Database
+from iam_service.emails import EMAIL_MAX_LENGTH, normalize_email
 from iam_service.federation import (
     FederationError,
     JsonFetcher,
@@ -58,6 +60,13 @@ from iam_service.people import (
     refuse,
     require_human_target,
 )
+from iam_service.people.connections import (
+    CONNECTION_SOURCE,
+    connection_issuer_tenant,
+    is_connection_issuer,
+    tenant_connection_prefix,
+)
+from iam_service.people.identities import create_identities_guard
 from iam_service.privileged import entitled_privileged_scopes
 from iam_service.schemas import (
     AudienceCreate,
@@ -80,11 +89,14 @@ from iam_service.schemas import (
     GroupView,
     IdentityProviderCreate,
     IdentityProviderView,
+    PrincipalByEmailPage,
     PrincipalCreate,
     PrincipalPage,
     PrincipalView,
     ServiceAccountCreate,
     ServiceAccountIssued,
+    ServiceAccountUpdate,
+    ServiceAccountView,
     TenantCreate,
     TenantView,
     TokenExchangeRequest,
@@ -151,6 +163,12 @@ def create_app(
 
     # Маршруты principals принимают, кроме bootstrap, человека со `iam:people`.
     people_caller = create_people_guard(settings=runtime_settings, get_session=get_session)
+    # Маршруты identity (ADR-0004) — ещё и агент со `iam:identities.link`.
+    identities_caller = create_identities_guard(
+        settings=runtime_settings, get_session=get_session, people_caller=people_caller
+    )
+    # Адрес поиска по почте не должен попасть в access log uvicorn.
+    install_access_log_filter()
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:
@@ -301,7 +319,8 @@ def create_app(
         контролирует сам, и federation-вход усыновил бы её — захват аккаунта.
         Поэтому по Bearer: цель — не сам вызывающий, issuer — активный
         провайдер tenant'а, а у цели ещё нет способа входа — ни одной external
-        identity (и отключённой тоже), ни действующего PAT или client secret — и
+        identity, кроме identity подключений (и отключённой тоже), ни
+        действующего PAT или client secret — и
         она не член группы администраторов людей. Всё прочее — только
         bootstrap.
         """
@@ -336,8 +355,14 @@ def create_app(
         )
         if provider is None:
             raise await deny(422, "identity_provider_unknown", f"issuer:{issuer}")
+        # Identity подключения входа не даёт (ADR-0004, п. 3) и онбордингу не мешает.
         existing = await session.scalar(
-            select(ExternalIdentity.id).where(ExternalIdentity.principal_id == target_id).limit(1)
+            select(ExternalIdentity.id)
+            .where(
+                ExternalIdentity.principal_id == target_id,
+                ExternalIdentity.source != CONNECTION_SOURCE,
+            )
+            .limit(1)
         )
         if existing is not None:
             raise await deny(409, "principal_has_identity", f"identity:{existing}")
@@ -383,7 +408,39 @@ def create_app(
     def people_reason(caller: Caller) -> str:
         if caller.bootstrap:
             return ""
+        if caller.agent:
+            return f"scope:{runtime_settings.identities_link_scope} pat:{caller.credential_id}"
         return f"scope:{runtime_settings.people_scope} identity:{caller.external_identity_id}"
+
+    async def require_own_connection_issuer(
+        session: AsyncSession,
+        caller: Caller,
+        *,
+        tenant_id: uuid.UUID,
+        issuer: str,
+        action: str,
+        resource_id: uuid.UUID,
+    ) -> None:
+        """Агент со `iam:identities.link` — только issuer подключений своего tenant'а.
+
+        Identity входа (IdP, каналы), подключения чужого tenant'а и любая иная
+        строка агенту не отвечают ничем, кроме отказа — до проверки формы
+        issuer и цели (ADR-0004, п. 5). Tenant token совпадает с путём: это
+        проверил guard.
+        """
+
+        if not caller.agent or issuer.startswith(tenant_connection_prefix(tenant_id)):
+            return
+        raise await refuse(
+            session,
+            tenant_id=tenant_id,
+            action=action,
+            actor_ref=caller.actor_ref,
+            resource_id=resource_id,
+            status_code=403,
+            detail="issuer_not_allowed",
+            reason=f"issuer:{issuer}",
+        )
 
     @app.post(
         "/api/v1/tenants/{tenant_id}/principals", response_model=PrincipalView, status_code=201
@@ -529,6 +586,58 @@ def create_app(
     ) -> Principal:
         return await tenant_principal(session, tenant_id, principal_id)
 
+    @app.get(
+        "/api/v1/tenants/{tenant_id}/principals:by-email",
+        response_model=PrincipalByEmailPage,
+        responses={422: {"description": "`invalid_email`"}},
+    )
+    async def find_principals_by_email(
+        tenant_id: uuid.UUID,
+        # Длина и форма проверяются здесь, а не валидатором FastAPI: ошибка
+        # валидации повторила бы адрес в теле ответа.
+        email: str = Query(json_schema_extra={"minLength": 3, "maxLength": EMAIL_MAX_LENGTH}),
+        _: Caller = Depends(identities_caller),
+        session: AsyncSession = Depends(get_session),
+    ) -> PrincipalByEmailPage:
+        """Люди tenant'а по почте, подтверждённой IdP при входе (ADR-0004, п. 2).
+
+        Только `human` и `active` с активным membership; почту подтвердил
+        активный провайдер этого tenant'а. Все совпадения отдаются как есть —
+        неоднозначность решает вызывающий. Чтение в audit не пишется: запись
+        с адресом положила бы персональные данные в журнал.
+        """
+
+        normalized = normalize_email(email) if 3 <= len(email) <= EMAIL_MAX_LENGTH else None
+        if normalized is None:
+            raise HTTPException(status_code=422, detail="invalid_email")
+        if await session.get(Tenant, tenant_id) is None:
+            raise HTTPException(status_code=404, detail="tenant_not_found")
+        principals = await session.scalars(
+            select(Principal)
+            .join(TenantMembership, TenantMembership.principal_id == Principal.id)
+            .join(ExternalIdentity, ExternalIdentity.principal_id == Principal.id)
+            .join(IdentityProvider, IdentityProvider.id == ExternalIdentity.identity_provider_id)
+            .where(
+                TenantMembership.tenant_id == tenant_id,
+                TenantMembership.status == "active",
+                Principal.kind == "human",
+                Principal.status == "active",
+                # Человек из SCIM, вошедший через IdP, остаётся `provisioned`:
+                # усыновление меняет source только identity без провайдера.
+                # Почту и у неё пишет только federation-вход.
+                ExternalIdentity.source.in_(("federated", "provisioned")),
+                ExternalIdentity.status == "active",
+                ExternalIdentity.email == normalized,
+                IdentityProvider.tenant_id == tenant_id,
+                IdentityProvider.status == "active",
+            )
+            .distinct()
+            .order_by(Principal.id)
+        )
+        return PrincipalByEmailPage(
+            items=[PrincipalView.model_validate(item) for item in principals]
+        )
+
     def identity_page(identities: list[ExternalIdentity]) -> ExternalIdentityPage:
         return ExternalIdentityPage(
             items=[ExternalIdentityItem.model_validate(item) for item in identities]
@@ -541,32 +650,52 @@ def create_app(
     async def find_external_identity(
         tenant_id: uuid.UUID,
         issuer: str = Query(min_length=1, max_length=500),
-        subject: str = Query(min_length=1, max_length=500),
-        _: Caller = Depends(people_caller),
+        subject: str | None = Query(default=None, min_length=1, max_length=500),
+        after: uuid.UUID | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=200),
+        caller: Caller = Depends(identities_caller),
         session: AsyncSession = Depends(get_session),
     ) -> ExternalIdentityPage:
-        """External identity по точной паре `(issuer, subject)`: 0 или 1.
+        """External identities tenant'а по issuer: с `subject` — точная пара (0 или 1).
 
         Пара уникальна глобально, но видна только identity Principal с
         активным membership этого tenant'а: чужой tenant — пустой ответ, а не
         404, чтобы не отличать «нет такой» от «есть, но не у вас». Статус
-        отдаётся как есть — отключённая identity тоже занимает пару.
+        отдаётся как есть — отключённая identity тоже занимает пару. Без
+        `subject` — все identity issuer'а постранично, по возрастанию `id`
+        (ADR-0004, п. 4.3); агент — только issuer подключений своего tenant'а.
         """
 
         if await session.get(Tenant, tenant_id) is None:
             raise HTTPException(status_code=404, detail="tenant_not_found")
-        identities = await session.scalars(
+        await require_own_connection_issuer(
+            session,
+            caller,
+            tenant_id=tenant_id,
+            issuer=issuer,
+            action="external_identities.find",
+            resource_id=caller.principal_id or tenant_id,
+        )
+        query = (
             select(ExternalIdentity)
             .join(TenantMembership, TenantMembership.principal_id == ExternalIdentity.principal_id)
             .where(
                 TenantMembership.tenant_id == tenant_id,
                 TenantMembership.status == "active",
                 ExternalIdentity.issuer == issuer,
-                ExternalIdentity.subject == subject,
             )
-            .limit(1)
         )
-        return identity_page(list(identities))
+        if subject is not None:
+            found = await session.scalars(query.where(ExternalIdentity.subject == subject).limit(1))
+            return identity_page(list(found))
+        if after is not None:
+            query = query.where(ExternalIdentity.id > after)
+        rows = list(await session.scalars(query.order_by(ExternalIdentity.id).limit(limit + 1)))
+        items = rows[:limit]
+        return ExternalIdentityPage(
+            items=[ExternalIdentityItem.model_validate(item) for item in items],
+            next_after=items[-1].id if len(rows) > limit else None,
+        )
 
     @app.get(
         "/api/v1/tenants/{tenant_id}/principals/{principal_id}/external-identities",
@@ -588,6 +717,51 @@ def create_app(
         )
         return identity_page(list(identities))
 
+    async def require_connection_target(
+        session: AsyncSession,
+        caller: Caller,
+        *,
+        tenant_id: uuid.UUID,
+        principal: Principal,
+        issuer: str,
+    ) -> None:
+        """Сопоставление подключения: форма issuer, tenant пути и цель (ADR-0004, п. 3–4.1).
+
+        Правила онбординга ADR-0002, п. 6, здесь не действуют: identity
+        подключения входа не даёт, и захватывать через неё нечего. Остаётся
+        запрет на себя для администратора людей — иначе он получал бы в зачёт
+        работу, закрытую во внешней системе чужими руками.
+        """
+
+        target_id, kind, status = principal.id, principal.kind, principal.status
+
+        async def deny(status_code: int, detail: str, reason: str) -> HTTPException:
+            return await refuse(
+                session,
+                tenant_id=tenant_id,
+                action="external_identities.link",
+                actor_ref=caller.actor_ref,
+                resource_id=target_id,
+                status_code=status_code,
+                detail=detail,
+                reason=reason,
+            )
+
+        issuer_tenant = connection_issuer_tenant(issuer)
+        if issuer_tenant is None:
+            raise await deny(422, "invalid_connection_issuer", f"issuer:{issuer}")
+        # Tenant issuer'а — tenant пути для любого вызывающего, включая bootstrap.
+        if issuer_tenant != tenant_id:
+            raise await deny(422, "issuer_tenant_mismatch", f"issuer:{issuer}")
+        if kind != "human":
+            raise await deny(422, "human_principal_required", f"kind:{kind}")
+        if caller.bootstrap:
+            return
+        if status != "active":
+            raise await deny(409, "principal_not_active", f"status:{status}")
+        if not caller.agent and target_id == caller.principal_id:
+            raise await deny(403, "self_link_forbidden", "self_link_forbidden")
+
     @app.post(
         "/api/v1/tenants/{tenant_id}/principals/{principal_id}/external-identities",
         response_model=ExternalIdentityView,
@@ -597,34 +771,58 @@ def create_app(
         tenant_id: uuid.UUID,
         principal_id: uuid.UUID,
         body: ExternalIdentityCreate,
-        caller: Caller = Depends(people_caller),
+        caller: Caller = Depends(identities_caller),
         session: AsyncSession = Depends(get_session),
     ) -> ExternalIdentity:
+        """Привязать identity; issuer `connection:<tenant>:<key>` — сопоставление подключения.
+
+        Источник выводится из issuer, а не выбирается вызывающим: префикс
+        `connection:` — всегда `source = connection` (ADR-0004, п. 3), иначе —
+        `manual` по прежним правилам (ADR-0002, п. 6). Агент со
+        `iam:identities.link` привязывает только identity подключений своего
+        tenant'а.
+        """
+
         action = "external_identities.link"
+        await require_own_connection_issuer(
+            session,
+            caller,
+            tenant_id=tenant_id,
+            issuer=body.issuer,
+            action=action,
+            resource_id=principal_id,
+        )
         principal = await people_principal(
             session, caller, tenant_id=tenant_id, principal_id=principal_id, action=action
         )
-        await require_human_target(
-            session, caller, tenant_id=tenant_id, principal=principal, action=action
-        )
-        if not caller.bootstrap:
-            await require_onboarding_link(
+        source = CONNECTION_SOURCE if is_connection_issuer(body.issuer) else "manual"
+        if source == CONNECTION_SOURCE:
+            await require_connection_target(
                 session, caller, tenant_id=tenant_id, principal=principal, issuer=body.issuer
             )
-        managed_by = await session.scalar(
-            select(IdentityProvider).where(
-                IdentityProvider.tenant_id == tenant_id,
-                IdentityProvider.issuer == body.issuer,
-                IdentityProvider.status == "active",
-                IdentityProvider.lifecycle_profile == "read_only",
+        else:
+            await require_human_target(
+                session, caller, tenant_id=tenant_id, principal=principal, action=action
             )
-        )
-        if managed_by is not None:
-            raise HTTPException(status_code=409, detail="identity_provider_managed")
+            if not caller.bootstrap:
+                await require_onboarding_link(
+                    session, caller, tenant_id=tenant_id, principal=principal, issuer=body.issuer
+                )
+            managed_by = await session.scalar(
+                select(IdentityProvider).where(
+                    IdentityProvider.tenant_id == tenant_id,
+                    IdentityProvider.issuer == body.issuer,
+                    IdentityProvider.status == "active",
+                    IdentityProvider.lifecycle_profile == "read_only",
+                )
+            )
+            if managed_by is not None:
+                raise HTTPException(status_code=409, detail="identity_provider_managed")
         identity = ExternalIdentity(
             principal_id=principal.id,
             issuer=body.issuer,
             subject=body.subject,
+            source=source,
         )
         session.add(identity)
         try:
@@ -638,6 +836,8 @@ def create_app(
                     payload={
                         "externalIdentityId": str(identity.id),
                         "principalId": str(principal.id),
+                        "source": source,
+                        "issuer": body.issuer,
                     },
                 )
             )
@@ -649,7 +849,7 @@ def create_app(
                     resource_type="external_identity",
                     resource_id=identity.id,
                     outcome="allowed",
-                    reason=people_reason(caller),
+                    reason=f"issuer:{body.issuer} {people_reason(caller)}".strip()[:1000],
                 )
             )
             await session.commit()
@@ -657,6 +857,107 @@ def create_app(
             await session.rollback()
             raise HTTPException(status_code=409, detail="external_identity_exists") from exc
         return identity
+
+    @app.delete(
+        "/api/v1/tenants/{tenant_id}/principals/{principal_id}/external-identities/{identity_id}",
+        status_code=204,
+        response_class=Response,
+    )
+    async def unlink_connection_identity(
+        tenant_id: uuid.UUID,
+        principal_id: uuid.UUID,
+        identity_id: uuid.UUID,
+        caller: Caller = Depends(identities_caller),
+        session: AsyncSession = Depends(get_session),
+    ) -> Response:
+        """Снять сопоставление identity подключения; пара освобождается (ADR-0004, п. 4.2).
+
+        Только `source = connection`: identity входа (IdP, SCIM, каналы)
+        снимаются своими путями. Строка удаляется, а не отключается, чтобы
+        пользователя внешней системы можно было сопоставить другому человеку.
+        """
+
+        action = "external_identities.unlink"
+        identity = await session.get(ExternalIdentity, identity_id)
+        owned = (
+            identity is not None
+            and identity.principal_id == principal_id
+            and await session.scalar(
+                select(TenantMembership.principal_id).where(
+                    TenantMembership.principal_id == principal_id,
+                    TenantMembership.tenant_id == tenant_id,
+                    TenantMembership.status == "active",
+                )
+            )
+            is not None
+        )
+
+        async def deny(status_code: int, detail: str, reason: str = "") -> HTTPException:
+            return await refuse(
+                session,
+                tenant_id=tenant_id,
+                action=action,
+                actor_ref=caller.actor_ref,
+                resource_id=principal_id,
+                status_code=status_code,
+                detail=detail,
+                reason=reason,
+            )
+
+        # Агенту чужое пространство имён отвечает отказом раньше, чем 404 за
+        # чужого Principal или tenant (ADR-0004, п. 5). Tenant агента проверил guard.
+        if identity is not None:
+            await require_own_connection_issuer(
+                session,
+                caller,
+                tenant_id=tenant_id,
+                issuer=identity.issuer,
+                action=action,
+                resource_id=principal_id,
+            )
+        if identity is None or not owned:
+            # Записи audit нужен существующий tenant: bootstrap может спросить
+            # и о несуществующем.
+            if await session.get(Tenant, tenant_id) is None:
+                raise HTTPException(status_code=404, detail="external_identity_not_found")
+            raise await deny(404, "external_identity_not_found", f"identity:{identity_id}")
+        issuer, source = identity.issuer, identity.source
+        if source != CONNECTION_SOURCE:
+            raise await deny(422, "connection_identity_required", f"source:{source}")
+        # Tenant issuer'а — tenant пути для любого вызывающего, включая bootstrap:
+        # identity чужого tenant'а могла попасть в базу только в обход API.
+        if not issuer.startswith(tenant_connection_prefix(tenant_id)):
+            raise await deny(422, "issuer_tenant_mismatch", f"issuer:{issuer}")
+        if not caller.bootstrap and not caller.agent and principal_id == caller.principal_id:
+            raise await deny(403, "self_link_forbidden")
+        await session.delete(identity)
+        session.add(
+            OutboxEvent(
+                tenant_id=tenant_id,
+                type="external_identity.unlinked",
+                aggregate_type="external_identity",
+                aggregate_id=identity_id,
+                payload={
+                    "externalIdentityId": str(identity_id),
+                    "principalId": str(principal_id),
+                    "source": source,
+                    "issuer": issuer,
+                },
+            )
+        )
+        session.add(
+            AuditEvent(
+                tenant_id=tenant_id,
+                action=action,
+                actor_ref=caller.actor_ref,
+                resource_type="external_identity",
+                resource_id=identity_id,
+                outcome="allowed",
+                reason=f"issuer:{issuer} {people_reason(caller)}".strip()[:1000],
+            )
+        )
+        await session.commit()
+        return Response(status_code=204)
 
     @app.post(
         "/api/v1/tenants/{tenant_id}/identity-providers",
@@ -1307,6 +1608,130 @@ def create_app(
         )
         await session.commit()
         return TokenResponse(accessToken=token, expiresIn=runtime_settings.token_ttl_seconds)
+
+    @app.patch(
+        "/api/v1/tenants/{tenant_id}/service-accounts/{client_id}",
+        response_model=ServiceAccountView,
+    )
+    async def update_service_account(
+        tenant_id: uuid.UUID,
+        client_id: str,
+        body: ServiceAccountUpdate,
+        actor: str = Depends(require_bootstrap),
+        session: AsyncSession = Depends(get_session),
+    ) -> ServiceAccountView:
+        """Изменить audiences и потолок scope service account (ADR-0005).
+
+        Principal сохраняется, поэтому агенты, которыми он владеет (ADR-0001),
+        остаются его агентами: расширение потолка не требует нового service
+        account. Без изменений и без `rotateSecret` операция ничего не пишет.
+        """
+        account = await session.scalar(
+            select(ServiceAccount).where(
+                ServiceAccount.tenant_id == tenant_id,
+                ServiceAccount.client_id == client_id,
+            )
+        )
+        if account is None:
+            raise HTTPException(status_code=404, detail="service_account_not_found")
+        if account.revoked_at is not None:
+            raise HTTPException(status_code=409, detail="service_account_revoked")
+        audiences = sorted(set(account.audiences if body.audiences is None else body.audiences))
+        scope_ceiling = sorted(
+            set(account.scope_ceiling if body.scope_ceiling is None else body.scope_ceiling)
+        )
+        registered = {
+            audience.key: set(audience.allowed_scopes)
+            for audience in await session.scalars(
+                select(Audience).where(
+                    Audience.tenant_id == tenant_id,
+                    Audience.status == "active",
+                    Audience.key.in_(audiences),
+                )
+            )
+        }
+        if set(registered) != set(audiences):
+            raise HTTPException(status_code=422, detail="unknown_audience")
+        # Потолок — в пределах реестра audience: scope, которого не разрешает ни
+        # один audience service account, выдать всё равно нельзя, и в потолке он
+        # только скрывал бы ошибку развёртывания.
+        allowed = set().union(*registered.values())
+        if any(scope not in allowed for scope in scope_ceiling):
+            raise HTTPException(status_code=422, detail="invalid_scope_ceiling")
+        secret: str | None = None
+        changed = audiences != list(account.audiences) or scope_ceiling != list(
+            account.scope_ceiling
+        )
+        if changed:
+            before_audiences = set(account.audiences)
+            before_scopes = set(account.scope_ceiling)
+            account.audiences = audiences
+            account.scope_ceiling = scope_ceiling
+            diff = [f"audience:+{key}" for key in sorted(set(audiences) - before_audiences)]
+            diff += [f"audience:-{key}" for key in sorted(before_audiences - set(audiences))]
+            diff += [f"scope:+{scope}" for scope in sorted(set(scope_ceiling) - before_scopes)]
+            diff += [f"scope:-{scope}" for scope in sorted(before_scopes - set(scope_ceiling))]
+            session.add(
+                OutboxEvent(
+                    tenant_id=tenant_id,
+                    type="service_account.updated",
+                    aggregate_type="service_account",
+                    aggregate_id=account.id,
+                    payload={
+                        "serviceAccountId": str(account.id),
+                        "principalId": str(account.principal_id),
+                        "audiences": audiences,
+                        "scopeCeiling": scope_ceiling,
+                    },
+                )
+            )
+            session.add(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    action="service_accounts.update",
+                    actor_ref=actor,
+                    resource_type="service_account",
+                    resource_id=account.id,
+                    outcome="allowed",
+                    reason=",".join(diff)[:1000],
+                )
+            )
+        if body.rotate_secret:
+            # Старый секрет перестаёт работать с этим commit; уже выданные по
+            # нему access token живут до своего TTL.
+            secret = secrets.token_urlsafe(32)
+            account.secret_hash = password_hasher.hash(secret)
+            session.add(
+                OutboxEvent(
+                    tenant_id=tenant_id,
+                    type="service_account.secret_rotated",
+                    aggregate_type="service_account",
+                    aggregate_id=account.id,
+                    payload={
+                        "serviceAccountId": str(account.id),
+                        "principalId": str(account.principal_id),
+                    },
+                )
+            )
+            session.add(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    action="service_accounts.rotate_secret",
+                    actor_ref=actor,
+                    resource_type="service_account",
+                    resource_id=account.id,
+                    outcome="allowed",
+                )
+            )
+        if changed or body.rotate_secret:
+            await session.commit()
+        return ServiceAccountView(
+            principalId=account.principal_id,
+            clientId=account.client_id,
+            audiences=audiences,
+            scopeCeiling=scope_ceiling,
+            clientSecret=secret,
+        )
 
     @app.post(
         "/api/v1/tenants/{tenant_id}/service-accounts/{client_id}:revoke",

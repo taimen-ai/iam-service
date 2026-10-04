@@ -218,6 +218,14 @@ the agent's access token has neither `auth_time` nor `acr`. Revoking the service
 account closes this path immediately rather than when its token expires. The
 decision is [ADR-0001](docs/adr/0001-iam-agents-scope.md).
 
+The controller's ceiling changes without a new service account (its agents stay
+its own): bootstrap `PATCH /api/v1/tenants/{tenantId}/service-accounts/{clientId}`
+`{"audiences"?, "scopeCeiling"?, "rotateSecret"?}` — each list is replaced as a
+whole, every ceiling scope must be allowed by one of the audiences
+(`422 invalid_scope_ceiling`), and a new secret is returned only with
+`rotateSecret`. Removing `iam:agents` closes the agents path immediately. The
+decision is [ADR-0005](docs/adr/0005-service-account-ceiling-update.md).
+
 ### Managing people: scope `iam:people`
 
 The runtime console creates, disables and re-enables people **without the bootstrap
@@ -272,6 +280,83 @@ The principal routes (create, list, read, link and read external identities,
   audited too (`outcome = denied`, `resource_type = principal`).
 
 The decision is [ADR-0002](docs/adr/0002-iam-people-scope.md).
+
+### Verified e-mail and people lookup
+
+An identity of a provider — created by login or provisioned by SCIM — keeps the
+e-mail of the last `federation:authenticate` / `federation:exchange` — only when
+the upstream token carries `email` and `email_verified` is JSON `true` (the
+string `"true"` does not count). The address is trimmed and lower-cased; an
+unverified, missing or malformed address clears the stored one, so a mailbox
+that stopped being verified stops matching at once. SCIM, bootstrap linking,
+channels and connections never write it. Internationalized domains are not
+normalized: an IDN and its punycode are different addresses; the connector looks
+up the form the IdP verifies. The e-mail is a lookup key only: it is not
+returned by any read, event or audit record, and access token claims do not
+change.
+
+`GET /api/v1/tenants/{tenantId}/principals:by-email?email=` returns `{"items":
+[...]}` — every active `human` of the tenant (active membership) with an active
+identity (`federated`, or `provisioned` — a SCIM person who has logged in
+through the IdP) of an active identity provider of that tenant carrying this
+e-mail. Zero, one or several matches are returned as is, sorted by id: resolving
+ambiguity is up to the caller. Agents, service accounts, workloads, disabled and
+paused people are never returned. A malformed address is `422 invalid_email`
+(the address is not echoed). Access: bootstrap, a human with `iam:people`, or an
+**agent** with `IAM_IDENTITIES_LINK_SCOPE` (`iam:identities.link`) — the token
+of its PAT exchange; on every request the PAT must be the agent's own, not
+revoked or expired, and the agent, its membership and the tenant must be active
+(`401 invalid_token`, audit `identities.authenticate` `closed:<what>`). A human
+with only `iam:identities.link` gets `403 scope_not_granted`; a service account
+or workload with it — `403 agent_required`. The lookup itself is not audited.
+The uvicorn access log replaces the value of the `email` query parameter with
+`[redacted]`, matching the decoded name (`?e%6Dail=` too); the perimeter must
+filter it from its own log. The decision is
+[ADR-0004](docs/adr/0004-connection-identities.md).
+
+### Connection identities: scope `iam:identities.link`
+
+A user of a connected external system (a CRM) is matched to a person of the
+organization as an external identity with `source = connection` and issuer
+`connection:<tenantId>:<connectionKey>` (tenant — canonical lower-case UUID,
+key — 1…200 of `[a-z0-9._-]`, no `:`); subject is the user id in that system.
+The source follows from the issuer: a link with the `connection:` prefix is
+always `connection`, otherwise `manual` as before. The pair `(issuer, subject)`
+is globally unique, like every identity. A connection identity is not a login:
+no token path accepts it, and the prefix is reserved — an identity provider
+issuer must be an `http(s)` URL (`422 invalid_issuer`), and the migration fails
+if a provider with a `connection:` issuer exists.
+
+- `POST …/principals/{principalId}/external-identities` with a connection
+  issuer: the issuer tenant must be the path tenant (`422
+  issuer_tenant_mismatch`), a malformed issuer is `422
+  invalid_connection_issuer`, the target must be a human (`422
+  human_principal_required`), and — over Bearer — active (`409
+  principal_not_active`). The onboarding rules of `iam:people` do not apply
+  (the person may already have logins), except that an administrator cannot
+  link to themselves (`403 self_link_forbidden`).
+- `DELETE …/principals/{principalId}/external-identities/{identityId}` removes
+  a connection identity and frees the pair (`204`, event
+  `external_identity.unlinked`, audit `external_identities.unlink`). Only
+  `source = connection` (`422 connection_identity_required`); an identity of
+  another principal or tenant is `404 external_identity_not_found`.
+- `GET /api/v1/tenants/{tenantId}/external-identities?issuer=` — `subject` is
+  optional now: without it, all identities of the issuer in the tenant, by
+  ascending id, `limit` 1…200 (100), cursor `after`, response field
+  `next_after` (always `null` with `subject`).
+
+All three routes (and `principals:by-email`) accept bootstrap, a human with
+`iam:people`, or an **agent** with `IAM_IDENTITIES_LINK_SCOPE`
+(`iam:identities.link`, the token of its PAT exchange). The agent is limited to
+issuers `connection:<its tenant>:` — a login issuer (IdP, Telegram channel),
+another tenant's connection or any other string is `403 issuer_not_allowed`,
+audited with the issuer, before any other check. The scope is not privileged:
+bootstrap adds it to the allowed scopes of audience `iam`, the owner's service
+account carries it in its ceiling, and the owner issues the agent a PAT with it
+(ADR-0001). Every other people route answers the agent `403 human_required`.
+`external_identity.linked` now carries `source` and `issuer` (manual,
+connection, federation, SCIM). The decision is
+[ADR-0004](docs/adr/0004-connection-identities.md).
 
 ### Privileged scopes
 
@@ -489,6 +574,7 @@ Bootstrap management API:
 - `POST /api/v1/tenants/{tenantId}/groups/{groupId}/members`;
 - `POST /api/v1/tenants/{tenantId}/audiences`;
 - `POST /api/v1/tenants/{tenantId}/service-accounts`;
+- `PATCH /api/v1/tenants/{tenantId}/service-accounts/{clientId}` (ADR-0005);
 - `POST /api/v1/tenants/{tenantId}/service-accounts/{clientId}:revoke`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}:disable`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}:enable`;
@@ -543,8 +629,13 @@ Managing people (bootstrap or an IAM token of a human with scope `iam:people`):
 - `GET /api/v1/tenants/{tenantId}/principals/{principalId}`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities`;
 - `GET /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities`;
-- `GET /api/v1/tenants/{tenantId}/external-identities?issuer=&subject=` (exact
-  pair, `{"items": []}` with zero or one item);
+- `DELETE /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities/{identityId}`
+  (connection identities only);
+- `GET /api/v1/tenants/{tenantId}/external-identities?issuer=&subject=&after=&limit=`
+  (with `subject` — the exact pair, zero or one item; without — pages,
+  `next_after`);
+- `GET /api/v1/tenants/{tenantId}/principals:by-email?email=` (also an agent
+  with `iam:identities.link`);
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}:disable`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}:enable`
   (`Idempotency-Key`).

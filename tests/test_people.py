@@ -759,21 +759,23 @@ def test_find_external_identity_by_exact_pair(harness: Harness) -> None:
                 "subject": "second",
                 "status": "active",
             }
-        ]
+        ],
+        # С `subject` — точная пара, без страниц (ADR-0004, п. 4.3).
+        "next_after": None,
     }
     assert other_subject.status_code == 200
-    assert other_subject.json() == {"items": []}
-    assert other_issuer.json() == {"items": []}
+    assert other_subject.json() == {"items": [], "next_after": None}
+    assert other_issuer.json() == {"items": [], "next_after": None}
 
 
-def test_find_external_identity_requires_both_params(harness: Harness) -> None:
+def test_find_external_identity_requires_issuer(harness: Harness) -> None:
+    """`subject` необязателен с ADR-0004 (п. 4.3), `issuer` — по-прежнему нужен."""
+
     headers, _ = harness.federate()
 
-    no_subject = find_identity(harness, headers, {"issuer": harness.idp.issuer})
     no_issuer = find_identity(harness, headers, {"subject": "admin"})
     empty = find_identity(harness, headers, {"issuer": harness.idp.issuer, "subject": ""})
 
-    assert no_subject.status_code == 422
     assert no_issuer.status_code == 422
     assert empty.status_code == 422
 
@@ -809,7 +811,7 @@ def test_external_identities_of_principal(harness: Harness) -> None:
     assert listed.status_code == 200, listed.text
     assert {item["subject"] for item in listed.json()["items"]} == {"first-login", "second-login"}
     assert {item["principal_id"] for item in listed.json()["items"]} == {person}
-    assert empty.json() == {"items": []}
+    assert empty.json() == {"items": [], "next_after": None}
     assert own.status_code == 200, own.text
     assert [item["subject"] for item in own.json()["items"]] == ["admin"]
     assert missing.status_code == 404
@@ -849,7 +851,7 @@ def test_external_identities_are_scoped_to_tenant(harness: Harness) -> None:
     )
 
     assert found.status_code == 200
-    assert found.json() == {"items": []}
+    assert found.json() == {"items": [], "next_after": None}
     assert by_principal.status_code == 404
     assert foreign_path.status_code == 403
     assert foreign_path.json()["detail"] == "tenant_mismatch"
@@ -944,7 +946,7 @@ def test_identity_of_principal_with_disabled_membership_is_hidden(harness: Harne
     )
 
     assert found.status_code == 200
-    assert found.json() == {"items": []}
+    assert found.json() == {"items": [], "next_after": None}
     assert listed.status_code == 404
     assert listed.json()["detail"] == "principal_not_found"
 

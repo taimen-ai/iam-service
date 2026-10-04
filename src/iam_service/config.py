@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     people_audience: str = "iam"
     people_scope: str = "iam:people"
     people_admin_group: str = "people-admins"
+    # Сопоставление identity подключений (ADR-0004, п. 5): scope того же
+    # audience `IAM_PEOPLE_AUDIENCE`, держатель — только агент. Не
+    # привилегированный: агент получает его обменом PAT.
+    identities_link_scope: str = "iam:identities.link"
     # Реестр привилегированных scope (ADR-0003): scope → ключ группы tenant'а
     # (`source = local`, заводит только bootstrap), члену которой federation
     # выдаёт scope по явному запросу. Дополняет BUILTIN_PRIVILEGED_SCOPES;

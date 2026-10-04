@@ -246,6 +246,8 @@ class ProvisioningService:
             identity.id,
             externalIdentityId=str(identity.id),
             principalId=str(principal.id),
+            source=IDENTITY_SOURCE_PROVISIONED,
+            issuer=self.provider.issuer,
         )
         self._event(
             "scim_user.provisioned",

@@ -71,6 +71,7 @@ async def link_identity(
             subject=upstream.subject,
             external_id=upstream.external_id,
             source="federated",
+            email=upstream.email,
         )
         session.add(identity)
         await session.flush()
@@ -96,6 +97,8 @@ async def link_identity(
                 payload={
                     "externalIdentityId": str(identity.id),
                     "principalId": str(principal.id),
+                    "source": "federated",
+                    "issuer": provider.issuer,
                     "identityProvider": provider.key,
                 },
             )
@@ -132,6 +135,9 @@ async def link_identity(
         )
     if identity.external_id is None:
         identity.external_id = upstream.external_id
+    # Источник истины почты — текущий token IdP: переставшая быть
+    # подтверждённой почта очищается и сразу перестаёт находить человека.
+    identity.email = upstream.email
     if identity.subject != upstream.subject:
         identity.subject = upstream.subject
         session.add(

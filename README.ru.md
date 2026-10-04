@@ -204,6 +204,14 @@ confidential service account, audience `IAM_AGENTS_AUDIENCE` (по умолча�
 account закрывает этот путь сразу, не дожидаясь истечения его token. Решение —
 [ADR-0001](docs/adr/0001-iam-agents-scope.md).
 
+Потолок контроллера меняется без нового service account (агенты остаются
+его агентами): bootstrap `PATCH /api/v1/tenants/{tenantId}/service-accounts/{clientId}`
+`{"audiences"?, "scopeCeiling"?, "rotateSecret"?}` — список заменяется целиком,
+каждый scope потолка должен быть разрешён одним из audiences
+(`422 invalid_scope_ceiling`), новый секрет возвращается только при
+`rotateSecret`. Снятый `iam:agents` закрывает путь агентов сразу. Решение —
+[ADR-0005](docs/adr/0005-service-account-ceiling-update.md).
+
 ### Управление людьми: scope `iam:people`
 
 Консоль runtime заводит, отключает и включает людей **без bootstrap-токена** — по token
@@ -256,6 +264,82 @@ scope `IAM_PEOPLE_SCOPE` (`iam:people`). Маршруты principals (созда
   (`outcome = denied`, `resource_type = principal`).
 
 Решение — [ADR-0002](docs/adr/0002-iam-people-scope.md).
+
+### Подтверждённая почта и поиск человека по почте
+
+Identity провайдера — созданная входом или заведённая SCIM — хранит почту
+последнего `federation:authenticate` / `federation:exchange` — только если
+upstream token несёт `email`, а `email_verified` равен JSON `true` (строка
+`"true"` не считается). Адрес обрезается по краям и приводится к нижнему
+регистру; неподтверждённый, отсутствующий или некорректный адрес очищает
+сохранённый — почта, переставшая быть подтверждённой, сразу перестаёт находить
+человека. SCIM, привязка bootstrap'ом, каналы и подключения её не пишут.
+Интернационализированные домены не нормализуются: IDN и его punycode — разные
+адреса, коннектор ищет в той форме, в какой почту подтверждает IdP. Почта —
+только ключ поиска: её нет ни в ответах чтения, ни в событиях, ни в audit;
+claims access token не меняются.
+
+`GET /api/v1/tenants/{tenantId}/principals:by-email?email=` возвращает
+`{"items": [...]}` — всех активных `human` tenant'а (активный membership) с
+активной identity (`federated` или `provisioned` — человек из SCIM, вошедший
+через IdP) активного провайдера этого tenant'а и этой почтой. Ноль, одно или
+несколько совпадений отдаются как есть, по возрастанию id: неоднозначность
+решает вызывающий. Агенты, service account, workload, отключённые и
+приостановленные люди не возвращаются никогда. Некорректный адрес — `422
+invalid_email` (адрес в ответ не попадает). Допуск: bootstrap, человек со
+`iam:people` или **агент** со `IAM_IDENTITIES_LINK_SCOPE`
+(`iam:identities.link`) — token обмена его PAT; на каждом запросе PAT должен
+быть его собственным, не отозванным и не истёкшим, а агент, его membership и
+tenant — активными (`401 invalid_token`, audit `identities.authenticate`
+`closed:<что>`). Человек только с `iam:identities.link` получает `403
+scope_not_granted`, service account или workload с ним — `403 agent_required`.
+Сам поиск в audit не пишется. Access log uvicorn заменяет значение параметра
+`email` на `[redacted]`, сравнивая декодированное имя (`?e%6Dail=` тоже);
+периметр должен вырезать его из своего лога. Решение —
+[ADR-0004](docs/adr/0004-connection-identities.md).
+
+### Identity подключений: scope `iam:identities.link`
+
+Пользователь подключённой внешней системы (CRM) сопоставляется с человеком
+организации как external identity с `source = connection` и issuer
+`connection:<tenantId>:<connectionKey>` (tenant — UUID в каноническом виде,
+ключ — 1…200 символов `[a-z0-9._-]`, без `:`); subject — id пользователя в этой
+системе. Источник выводится из issuer: привязка с префиксом `connection:` —
+всегда `connection`, иначе — `manual`, как раньше. Пара `(issuer, subject)`
+уникальна глобально, как у любой identity. Identity подключения — не вход: ни
+один путь выпуска token её не принимает, а префикс зарезервирован — issuer
+identity provider обязан быть `http(s)` URL (`422 invalid_issuer`), и миграция
+падает, если провайдер с issuer `connection:` уже есть.
+
+- `POST …/principals/{principalId}/external-identities` с issuer подключения:
+  tenant issuer'а — tenant пути (`422 issuer_tenant_mismatch`), иная форма —
+  `422 invalid_connection_issuer`, цель — человек (`422
+  human_principal_required`), по Bearer — ещё и активный (`409
+  principal_not_active`). Правила онбординга `iam:people` не действуют (у
+  человека уже могут быть входы), кроме запрета привязки к себе (`403
+  self_link_forbidden`).
+- `DELETE …/principals/{principalId}/external-identities/{identityId}` удаляет
+  identity подключения и освобождает пару (`204`, событие
+  `external_identity.unlinked`, audit `external_identities.unlink`). Только
+  `source = connection` (`422 connection_identity_required`); identity чужого
+  Principal или tenant'а — `404 external_identity_not_found`.
+- `GET /api/v1/tenants/{tenantId}/external-identities?issuer=` — `subject`
+  теперь необязателен: без него — все identity issuer'а в tenant'е по
+  возрастанию id, `limit` 1…200 (100), курсор `after`, поле ответа
+  `next_after` (с `subject` всегда `null`).
+
+Все три маршрута (и `principals:by-email`) принимают bootstrap, человека со
+`iam:people` или **агента** со `IAM_IDENTITIES_LINK_SCOPE`
+(`iam:identities.link`, token обмена его PAT). Агенту доступны только issuer
+`connection:<свой tenant>:` — issuer входа (IdP, канал Telegram), подключение
+чужого tenant'а или любая иная строка — `403 issuer_not_allowed` с записью в
+audit, раньше всех прочих проверок. Scope не привилегированный: bootstrap
+добавляет его в allowed scopes audience `iam`, потолок service account
+владельца его содержит, и владелец выпускает агенту PAT с ним (ADR-0001).
+Остальные маршруты людей отвечают агенту `403 human_required`. Событие
+`external_identity.linked` теперь несёт `source` и `issuer` (manual,
+connection, federation, SCIM). Решение —
+[ADR-0004](docs/adr/0004-connection-identities.md).
 
 ### Привилегированные scope
 
@@ -465,6 +549,7 @@ Bootstrap management API:
 - `POST /api/v1/tenants/{tenantId}/groups/{groupId}/members`;
 - `POST /api/v1/tenants/{tenantId}/audiences`;
 - `POST /api/v1/tenants/{tenantId}/service-accounts`;
+- `PATCH /api/v1/tenants/{tenantId}/service-accounts/{clientId}` (ADR-0005);
 - `POST /api/v1/tenants/{tenantId}/service-accounts/{clientId}:revoke`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}:disable`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}:enable`;
@@ -519,8 +604,13 @@ Credential и federation API:
 - `GET /api/v1/tenants/{tenantId}/principals/{principalId}`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities`;
 - `GET /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities`;
-- `GET /api/v1/tenants/{tenantId}/external-identities?issuer=&subject=` (точная
-  пара, `{"items": []}` из нуля или одного элемента);
+- `DELETE /api/v1/tenants/{tenantId}/principals/{principalId}/external-identities/{identityId}`
+  (только identity подключений);
+- `GET /api/v1/tenants/{tenantId}/external-identities?issuer=&subject=&after=&limit=`
+  (с `subject` — точная пара, ноль или один элемент; без — страницами,
+  `next_after`);
+- `GET /api/v1/tenants/{tenantId}/principals:by-email?email=` (ещё и агент
+  со `iam:identities.link`);
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}:disable`;
 - `POST /api/v1/tenants/{tenantId}/principals/{principalId}:enable`
   (`Idempotency-Key`).

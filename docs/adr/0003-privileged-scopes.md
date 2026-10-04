@@ -3,7 +3,8 @@
 *English title: IAM privileged scopes — group members only, on explicit request.*
 
 - Статус: принято (фича runtime-console, задача TASK-000859; найдено
-  независимым ревью R004, 2026-09-29; п. 7 дополнен `:enable`, TASK-000907).
+  независимым ревью R004, 2026-09-29; п. 7 дополнен `:enable`, TASK-000907;
+  п. 8 дополнен `iam:identities.link`, TASK-000989).
 - Требования: конституция, ст. VI (узкий путь выдачи, безопасное умолчание).
 - Обобщает: п. 3–4 [ADR-0002](0002-iam-people-scope.md) (`iam:people`) — теперь
   это частный случай общего правила. Прецедент: [ADR-0001](0001-iam-agents-scope.md).
@@ -116,6 +117,12 @@ fleet-controller проверяет только scope, этот человек 
    - `iam:agents` для человека не работает: маршруты агентов принимают только
      `principal_type = service_account` (`403 service_account_required`,
      ADR-0001). Группа ему не нужна.
+   - `iam:identities.link` (амендмент, TASK-000989) — в реестр не вносится:
+     агент получает его только обменом PAT, который привилегированных scope не
+     приносит (п. 5). Guard принимает scope только от `principal_type = agent`
+     и только на issuer `connection:<tenant token>:` — человеку, получившему
+     его пустым запросом federation, он ничего не даёт
+     ([ADR-0004](0004-connection-identities.md), п. 5).
 
    Если сервис начнёт давать authority по одному только scope, scope нужно
    внести в реестр (п. 1) — встроенно или через `IAM_PRIVILEGED_SCOPES`.

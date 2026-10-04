@@ -182,6 +182,23 @@ def create_agent_router(
             or principal.status != "active"
         ):
             raise HTTPException(status_code=401, detail="invalid_token")
+        # Потолок меняет bootstrap (ADR-0005): снятый `iam:agents` закрывает путь
+        # по записи, а не по истечению уже выданного token.
+        if (
+            settings.agents_scope not in account.scope_ceiling
+            or settings.agents_audience not in account.audiences
+        ):
+            raise await refuse(
+                session,
+                tenant_id=tenant_id,
+                action=action,
+                actor_ref=str(subject),
+                resource_type="service_account",
+                resource_id=account.id,
+                status_code=403,
+                detail="scope_not_granted",
+                reason="scope_ceiling",
+            )
         return account
 
     async def owned_agent(

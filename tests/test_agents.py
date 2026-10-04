@@ -414,6 +414,136 @@ def test_disabled_agent_gets_no_new_credential(harness: Harness) -> None:
     assert harness.revoke(headers, agent, issued["credential"]["id"]).status_code == 204
 
 
+def update_service_account(harness: Harness, client_id: str, body: dict, *, headers=BOOTSTRAP):
+    return harness.client.patch(
+        f"/api/v1/tenants/{harness.tenant_id}/service-accounts/{client_id}",
+        headers=headers,
+        json=body,
+    )
+
+
+def test_widening_owner_ceiling_keeps_agents_without_new_service_account(harness: Harness) -> None:
+    """Приёмка ADR-0005: расширение потолка контроллера — агенты продолжают
+    получать PAT от того же владельца, без нового service account и SQL."""
+
+    headers, account = harness.controller()
+    agent = harness.create_agent(headers).json()["id"]
+    assert harness.issue(headers, agent).status_code == 201
+    memory = {"audiences": ["memory-service"], "ceiling": ["memory:read"]}
+    assert harness.issue(headers, agent, **memory).status_code == 422
+
+    updated = update_service_account(
+        harness,
+        account["clientId"],
+        {
+            "audiences": ["iam", "control-plane", "memory-service"],
+            "scopeCeiling": ["iam:agents", "control-plane:read", "memory:read"],
+            "rotateSecret": True,
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    view = updated.json()
+    assert view["principalId"] == account["principalId"]
+    assert view["clientId"] == account["clientId"]
+    assert view["audiences"] == ["control-plane", "iam", "memory-service"]
+    assert view["scopeCeiling"] == ["control-plane:read", "iam:agents", "memory:read"]
+    new_secret = view["clientSecret"]
+    assert new_secret and new_secret != account["clientSecret"]
+
+    # Старый секрет погашен сразу.
+    stale = harness.client.post(
+        "/api/v1/tokens/exchange",
+        json={
+            "clientId": account["clientId"],
+            "clientSecret": account["clientSecret"],
+            "audience": "iam",
+            "scopes": ["iam:agents"],
+        },
+    )
+    assert stale.status_code == 401
+    renewed = harness.bearer({**account, "clientSecret": new_secret})
+
+    # Тот же агент, тот же владелец — никакого agent_not_owned.
+    for body in ({}, memory):
+        issued = harness.issue(renewed, agent, **body)
+        assert issued.status_code == 201, issued.text
+    assert harness.exchange(issued.json()["token"], audience="memory-service").status_code == 200
+
+    assert harness.audit("service_accounts.update") == [
+        ("bootstrap", "allowed", "audience:+memory-service,scope:+memory:read")
+    ]
+    assert [row[:2] for row in harness.audit("service_accounts.rotate_secret")] == [
+        ("bootstrap", "allowed")
+    ]
+    events = harness.client.get("/api/v1/events", headers=BOOTSTRAP).json()["items"]
+    types = [event["type"] for event in events]
+    assert "service_account.updated" in types and "service_account.secret_rotated" in types
+    assert new_secret not in str(events)
+    assert new_secret not in str(harness.audit("service_accounts.rotate_secret"))
+
+    # Повтор того же потолка без ротации ничего не пишет и секрет не отдаёт.
+    again = update_service_account(
+        harness, account["clientId"], {"scopeCeiling": view["scopeCeiling"]}
+    )
+    assert again.status_code == 200
+    assert again.json()["clientSecret"] is None
+    assert len(harness.audit("service_accounts.update")) == 1
+    assert len(harness.client.get("/api/v1/events", headers=BOOTSTRAP).json()["items"]) == len(
+        events
+    )
+
+
+def test_service_account_update_is_bootstrap_only_and_within_audience_registry(
+    harness: Harness,
+) -> None:
+    headers, account = harness.controller()
+    client_id = account["clientId"]
+
+    def refused(body: dict, **kwargs) -> tuple[int, str]:
+        response = update_service_account(harness, client_id, body, **kwargs)
+        return response.status_code, response.json()["detail"]
+
+    # Ни сам service account, ни чужой токен потолок не меняют.
+    assert refused({"scopeCeiling": ["iam:agents"]}, headers=headers)[0] == 401
+    assert refused({"scopeCeiling": ["iam:agents"]}, headers={})[0] == 401
+    assert refused({"audiences": ["billing"]}) == (422, "unknown_audience")
+    assert refused({"audiences": []})[0] == 422
+    # Scope, которого не разрешает ни один audience service account.
+    assert refused({"scopeCeiling": ["memory:read"]}) == (422, "invalid_scope_ceiling")
+    assert refused({"scopeCeiling": ["iam:people"]}) == (422, "invalid_scope_ceiling")
+    # Сужение audiences требует сузить и потолок.
+    assert refused({"audiences": ["iam"]}) == (422, "invalid_scope_ceiling")
+    assert update_service_account(harness, "iam_sa_unknown", {}).status_code == 404
+    # Client id чужого tenant'а в этом tenant'е не находится.
+    other_tenant = harness.tenant("tenant-b")
+    foreign = harness.service_account(tenant_id=other_tenant)
+    assert update_service_account(harness, foreign["clientId"], {}).status_code == 404
+    assert harness.audit("service_accounts.update") == []
+
+    revoked = harness.client.post(
+        f"/api/v1/tenants/{harness.tenant_id}/service-accounts/{client_id}:revoke",
+        headers=BOOTSTRAP,
+    )
+    assert revoked.status_code == 204
+    assert refused({"rotateSecret": True}) == (409, "service_account_revoked")
+
+
+def test_narrowing_owner_ceiling_closes_agents_path_at_once(harness: Harness) -> None:
+    headers, account = harness.controller()
+    agent = harness.create_agent(headers).json()["id"]
+
+    narrowed = update_service_account(
+        harness, account["clientId"], {"scopeCeiling": ["control-plane:read"]}
+    )
+    assert narrowed.status_code == 200, narrowed.text
+    # Token ещё не истёк, но потолок уже без `iam:agents`: путь закрыт по записи.
+    for response in (harness.create_agent(headers), harness.issue(headers, agent)):
+        assert response.status_code == 403
+        assert response.json()["detail"] == "scope_not_granted"
+    denied = harness.audit("agents.authenticate")
+    assert (account["principalId"], "denied", "scope_ceiling") in denied
+
+
 def test_migration_adds_and_drops_principal_owner(tmp_path) -> None:
     database_path = tmp_path / "migration.db"
     config = Config("alembic.ini")

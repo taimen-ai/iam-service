@@ -315,6 +315,11 @@ def test_provisioning_creates_identity_without_entitlement_or_local_grants(
     payloads = str(harness.events("scim_user.provisioned"))
     assert "ada@example.com" not in payloads
     assert body["id"] in payloads
+    # Привязка называет источник и issuer провайдера (ADR-0004, п. 4.1).
+    [linked] = harness.events("external_identity.linked")
+    assert linked["payload"]["source"] == "provisioned"
+    assert linked["payload"]["issuer"] == identity.issuer
+    assert "ada@example.com" not in str(linked)
 
 
 def test_repeated_create_does_not_produce_a_second_principal(harness: Harness) -> None:
@@ -689,3 +694,57 @@ def test_federated_login_adopts_the_provisioned_identity(harness: Harness, idp) 
         assert identity.principal_id == principal_id
         # Второй Principal не появился: SCIM-запись и вход — одна identity.
         assert len(session.scalars(select(Principal).where(Principal.kind == "human")).all()) == 1
+
+
+def test_provisioned_person_is_found_by_email_after_federated_login(harness: Harness, idp) -> None:
+    """Человек из SCIM находится поиском по почте после входа через IdP (ADR-0004, п. 2).
+
+    Identity остаётся `provisioned`: у неё уже есть провайдер, и усыновление
+    source не меняет. Почту пишет вход, SCIM `emails` в неё не попадает.
+    """
+
+    created = harness.scim(
+        "POST",
+        "/scim/v2/Users",
+        json={
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "externalId": "hr-1",
+            "userName": "ada@example.com",
+            "emails": [{"value": "ada@example.com", "primary": True}],
+            "active": True,
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    def found() -> list[str]:
+        response = harness.client.get(
+            f"/api/v1/tenants/{harness.tenant_id}/principals:by-email",
+            params={"email": "ada@example.com"},
+            headers=BOOTSTRAP,
+        )
+        assert response.status_code == 200, response.text
+        return [item["id"] for item in response.json()["items"]]
+
+    assert found() == []
+
+    authenticated = harness.client.post(
+        f"/api/v1/tenants/{harness.tenant_id}/federation:authenticate",
+        json={
+            "identityProvider": "workforce",
+            "token": idp.token(
+                subject="keycloak-uuid",
+                claims={
+                    EXTERNAL_ID_CLAIM: "hr-1",
+                    "email": "Ada@Example.com",
+                    "email_verified": True,
+                },
+            ),
+        },
+    )
+
+    assert authenticated.status_code == 200, authenticated.text
+    with harness.session() as session:
+        identity = session.scalars(select(ExternalIdentity)).one()
+        assert identity.source == "provisioned"
+        assert identity.email == "ada@example.com"
+    assert found() == [authenticated.json()["principalId"]]

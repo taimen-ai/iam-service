@@ -11,7 +11,9 @@
   [ADR-0003](0003-privileged-scopes.md) — `iam:people` там частный случай;
   амендмент 2026-09-29, TASK-000908 — чтение external identities, п. 11;
   амендмент 2026-09-29, TASK-000907 — `:enable`, обратная операция к
-  `:disable`, п. 12).
+  `:disable`, п. 12; амендмент 2026-09-29, TASK-000989 — identity
+  подключений и поиск по почте, п. 6 и 11 дополнены ссылками на
+  [ADR-0004](0004-connection-identities.md)).
 - Требования: FR-013, FR-004; конституция, ст. V, VI.
 - Прецедент: [ADR-0001](0001-iam-agents-scope.md) (`iam:agents`).
 - Границы: верхнеуровневые ADR-0012 (Platform Access Token) и ADR-0013 (IAM
@@ -99,7 +101,8 @@ boundary всего IAM, которую нельзя отдавать ни бр�
      (`422 identity_provider_unknown`); read-only провайдер по-прежнему
      отвечает `409 identity_provider_managed`;
    - у цели нет ни одной external identity, включая отключённую
-     (`409 principal_has_identity`);
+     (`409 principal_has_identity`); identity подключения (`source =
+     connection`, ADR-0004) не считается — входа она не даёт;
    - у цели нет действующего credential — неотозванного и неистёкшего PAT
      или client secret service account (`409 principal_has_credential`):
      человек, входящий только по PAT, — не новичок;
@@ -116,6 +119,13 @@ boundary всего IAM, которую нельзя отдавать ни бр�
 
    Всё прочее (вторая identity, чужой issuer, восстановление входа) — только
    bootstrap.
+
+   Исключение (амендмент, TASK-000989): identity подключения — issuer
+   `connection:<свой tenant>:<ключ>` — входа не даёт, и правила этого пункта,
+   кроме запрета привязки к себе, к ней не применяются. Её привязка и снятие
+   (`DELETE`) — [ADR-0004](0004-connection-identities.md), п. 3–4. И обратно:
+   человек, сопоставленный только с пользователем подключения, остаётся
+   новичком — ему можно привязать вход (TASK-001042).
 7. **`:disable` по Bearer** не отключает самого вызывающего
    (`409 self_disable_forbidden`) и членов группы администраторов людей
    (`403 people_admin_protected`) — это остаётся за bootstrap.
@@ -183,6 +193,13 @@ boundary всего IAM, которую нельзя отдавать ни бр�
    `people_admin_protected`. Чтение в audit не пишется, как и прочие `GET`
    людей; отказ допуска (`people.authenticate`) пишется guard'ом как прежде.
    `403 tenant_mismatch` — у token другого tenant'а.
+
+   Амендмент TASK-000989: `subject` в поиске по паре становится
+   необязательным — без него ответ перечисляет identities issuer'а страницами
+   (`after`, `limit`, поле `next_after`); тот же поиск и `GET
+   …/principals:by-email` доступны агенту со scope `iam:identities.link` на
+   issuer своих подключений — [ADR-0004](0004-connection-identities.md),
+   п. 2, 4–5.
 
 12. **`:enable` — обратная операция к `:disable`** (амендмент, TASK-000907).
    До него отключённого человека вернуть было нечем: ни bootstrap, ни

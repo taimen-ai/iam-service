@@ -7,6 +7,7 @@ from typing import Any
 
 import jwt
 
+from iam_service.emails import normalize_email
 from iam_service.federation.errors import FederationError
 
 ALLOWED_ALGORITHMS = ("RS256", "RS384", "RS512", "ES256", "ES384")
@@ -26,6 +27,8 @@ class UpstreamClaims:
     external_id: str
     groups: tuple[str, ...]
     context: AuthenticationContext
+    # Нормализованная почта, только если IdP её подтвердил (ADR-0004, п. 1).
+    email: str | None = None
 
 
 def verify_upstream_token(
@@ -99,7 +102,21 @@ def read_claims(
             amr=_string_list(claims.get("amr")),
             auth_time=_timestamp(claims.get("auth_time")),
         ),
+        email=verified_email(claims),
     )
+
+
+def verified_email(claims: Mapping[str, Any]) -> str | None:
+    """Почта upstream token, если IdP её подтвердил, иначе `None`.
+
+    Имена claims стандартные OIDC и не настраиваются у провайдера: ошибкой
+    конфигурации нельзя сделать ключом сопоставления неподтверждённый
+    атрибут. Подтверждение — только JSON `true`; строка `"true"` не считается.
+    """
+
+    if claims.get("email_verified") is not True:
+        return None
+    return normalize_email(claims.get("email"))
 
 
 def ensure_authentication_context(

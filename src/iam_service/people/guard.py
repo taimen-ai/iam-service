@@ -46,12 +46,16 @@ BOOTSTRAP_ACTOR = "bootstrap"
 class Caller:
     """Вызывающий маршрута управления людьми.
 
-    `actor_ref` пишется в audit: `bootstrap` или id Principal человека.
+    `actor_ref` пишется в audit: `bootstrap` или id Principal человека
+    (агента — на маршрутах `iam:identities.link`, ADR-0004).
     """
 
     actor_ref: str
     principal_id: uuid.UUID | None = None
     external_identity_id: uuid.UUID | None = None
+    agent: bool = False
+    # PAT, обменом которого агент получил token: называется в audit.
+    credential_id: uuid.UUID | None = None
 
     @property
     def bootstrap(self) -> bool:

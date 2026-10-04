@@ -43,6 +43,15 @@ class PrincipalPage(BaseModel):
     next_after: uuid.UUID | None
 
 
+class PrincipalByEmailPage(BaseModel):
+    """Люди по подтверждённой почте (ADR-0004, п. 2): только `human`, `active`.
+
+    Ноль, один или несколько — без пагинации, совпадений единицы.
+    """
+
+    items: list[PrincipalView]
+
+
 class ExternalIdentityCreate(BaseModel):
     issuer: str = Field(min_length=1, max_length=500)
     subject: str = Field(min_length=1, max_length=500)
@@ -77,7 +86,14 @@ class ExternalIdentityItem(BaseModel):
 
 
 class ExternalIdentityPage(BaseModel):
+    """Страница identity; `next_after` — `id` последнего элемента, если есть ещё.
+
+    Постранично отдаётся только список по issuer без subject (ADR-0004,
+    п. 4.3); в прочих ответах поле всегда `null`.
+    """
+
     items: list[ExternalIdentityItem]
+    next_after: uuid.UUID | None = None
 
 
 class IdentityProviderCreate(BaseModel):
@@ -216,6 +232,27 @@ class ServiceAccountIssued(BaseModel):
     principal_id: uuid.UUID = Field(alias="principalId")
     client_id: str = Field(alias="clientId")
     client_secret: str = Field(alias="clientSecret")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ServiceAccountUpdate(BaseModel):
+    """Изменение потолка service account (bootstrap, ADR-0005): Principal и
+    client id сохраняются. Пропущенное поле не меняется; список заменяется
+    целиком. `rotateSecret` выпускает новый секрет и сразу гасит старый."""
+
+    audiences: list[str] | None = Field(default=None, min_length=1)
+    scope_ceiling: list[str] | None = Field(alias="scopeCeiling", default=None)
+    rotate_secret: bool = Field(alias="rotateSecret", default=False)
+
+
+class ServiceAccountView(BaseModel):
+    principal_id: uuid.UUID = Field(alias="principalId")
+    client_id: str = Field(alias="clientId")
+    audiences: list[str]
+    scope_ceiling: list[str] = Field(alias="scopeCeiling")
+    # Новый секрет — только в ответе с `rotateSecret`, один раз.
+    client_secret: str | None = Field(alias="clientSecret", default=None)
 
     model_config = ConfigDict(populate_by_name=True)
 
